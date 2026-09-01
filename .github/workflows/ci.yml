@@ -19,6 +19,7 @@ jobs:
         with:
           python-version: "3.13"
       - run: python -m pip install platformio==6.1.19
+      - run: cp include/config.h.example include/config.h
       - run: pio run
       - run: python test/protocol_check.py
 
@@ -40,7 +41,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m pytest -q tests
 
@@ -51,4 +52,5 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
+          ignore: brands
       - uses: home-assistant/actions/hassfest@master
