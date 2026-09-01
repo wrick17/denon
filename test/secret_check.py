@@ -27,6 +27,15 @@ TOKEN_VALUE = re.compile(
 WIFI_DEFAULT = re.compile(
     r'''(?i)#define\s+WIFI_(?:SSID|PASSWORD)\s+["']([^"']+)["']'''
 )
+NETWORK_VALUE = re.compile(
+    r'''(?ix)\b(?:preferred[_-]?ip|static[_-]?ip|local[_-]?ip|gateway|'''
+    r'''subnet(?:[_-]?mask)?|dns(?:[_-]?server)?)\b[^\n\d]{0,24}'''
+    r'''((?:\d{1,3}\.){3}\d{1,3})'''
+)
+IPV4_CONSTRUCTOR = re.compile(
+    r"\bIPAddress(?:\s+[A-Za-z_]\w*)?\s*\(\s*(\d{1,3})\s*,\s*"
+    r"(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)"
+)
 PLACEHOLDER_PREFIXES = ("<", "${", "{{", "example", "replace_", "your_")
 
 
@@ -55,6 +64,17 @@ def is_private_ipv4(value: str) -> bool:
     )
 
 
+def is_documentation_ipv4(value: str) -> bool:
+    """Allow only loopback and the IPv4 ranges reserved for examples."""
+    octets = tuple(int(part) for part in value.split("."))
+    return (
+        octets[0] == 127
+        or octets[:3] == (192, 0, 2)
+        or octets[:3] == (198, 51, 100)
+        or octets[:3] == (203, 0, 113)
+    )
+
+
 def is_placeholder(value: str) -> bool:
     return value.strip().lower().startswith(PLACEHOLDER_PREFIXES)
 
@@ -78,6 +98,18 @@ def findings(path: Path, text: str) -> list[str]:
         wifi = WIFI_DEFAULT.search(line)
         if wifi and not is_placeholder(wifi.group(1)):
             found.append(f"{path.relative_to(ROOT)}:{line_number}: non-empty Wi-Fi default")
+        network = NETWORK_VALUE.search(line)
+        if network and not is_documentation_ipv4(network.group(1)):
+            found.append(
+                f"{path.relative_to(ROOT)}:{line_number}: concrete network setting"
+            )
+        constructor = IPV4_CONSTRUCTOR.search(line)
+        if constructor:
+            address = ".".join(constructor.groups())
+            if not is_documentation_ipv4(address) and address != "255.255.255.0":
+                found.append(
+                    f"{path.relative_to(ROOT)}:{line_number}: concrete IPAddress"
+                )
     return found
 
 
@@ -98,10 +130,16 @@ def self_test() -> None:
     entity = "media_" + "player.living_room"
     jwt = "eyJ" + "a" * 8 + "." + "b" * 8 + "." + "c" * 8
     wifi = '#define WIFI_' + 'SSID "real-network"'
-    sample = "\n".join((private_ip, mac, entity, jwt, wifi))
+    subnet = "subnet = " + ".".join(("255", "255", "255", "0"))
+    dns = "dns_server = " + ".".join(("8", "8", "8", "8"))
+    constructor = "IPAddress localIp(" + ", ".join(("10", "1", "2", "3")) + ")"
+    sample = "\n".join(
+        (private_ip, mac, entity, jwt, wifi, subnet, dns, constructor)
+    )
     reasons = findings(ROOT / "sample", sample)
-    assert len(reasons) == 5, reasons
+    assert len(reasons) == 8, reasons
     assert not findings(ROOT / "sample", loopback)
+    assert not findings(ROOT / "sample", "gateway = 203.0.113.1")
     assert not findings(ROOT / "sample", '#define WIFI_SSID ""')
     assert not findings(ROOT / "sample", 'access_token: "<HOME_ASSISTANT_TOKEN>"')
     assert not findings(ROOT / "sample", "media_player.example_apple_tv")

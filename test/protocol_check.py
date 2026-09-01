@@ -147,18 +147,119 @@ assert source.index("esp_bt_gap_remove_bond_device(denonMac)") < source.index(
     "denonBonded = false;", source.index("void forgetDenon()")
 )
 assert "[" + "DEBUG-BT]" not in source
-assert "WiFi.config(" not in source
+network_check = source[
+    source.index("bool networkSelfCheck()") : source.index("bool isHexText(")
+]
+assert 'parseIpv4("203.0.113.7", parsed)' in network_check
+assert '!parseIpv4("203.0.113", parsed)' in network_check
+assert '!parseIpv4("203.0.113.256", parsed)' in network_check
+assert "isSetupApIngress(true, true, false)" in network_check
+assert "!isSetupApIngress(true, false, true)" in network_check
+assert "!isSetupApIngress(true, true, true)" in network_check
+assert "isStationIngress(true, true, false)" in network_check
+assert "!isStationIngress(true, false, true)" in network_check
+static_storage = source[
+    source.index("enum NetworkStorageKey") : source.index("void loadStaticNetwork()")
+]
+for key in (
+    "wifi_ssid",
+    "wifi_password",
+    "static_ip",
+    "static_gw",
+    "static_mask",
+    "static_dns",
+    "pending_ip",
+):
+    assert f'"{key}"' in static_storage
+assert "const NetworkStorageState previous = readNetworkStorage();" in static_storage
+assert "if (writeNetworkStorage(desired)) return true;" in static_storage
+assert "writeNetworkStorage(previous)" in static_storage
+assert "preferences.isKey(kNetworkStorageKeys[i])" in static_storage
+assert "preferences.getString(kNetworkStorageKeys[i]" in static_storage
+assert "commitNetworkStorage(desired)" in static_storage
+station_server = source[
+    source.index("class StationAwareWebServer") : source.index(
+        "StationAwareWebServer server"
+    )
+]
+assert "_currentClient.localIP()" in station_server
+assert "isStationIngress(WiFi.status() == WL_CONNECTED" in station_server
+assert "localAddress == WiFi.localIP()" in station_server
+assert "localAddress == WiFi.softAPIP()" in station_server
+assert "stationHttpClaimed = true;" in station_server
+assert station_server.count("markStationRequest();") == 2
+assert station_server.count("if (length > 0 && written == length)") == 2
+write_ram = station_server[
+    station_server.index("size_t _currentClientWrite(") : station_server.index(
+        "size_t _currentClientWrite_P("
+    )
+]
+write_flash = station_server[
+    station_server.index("size_t _currentClientWrite_P(") : station_server.index(
+        " private:"
+    )
+]
+for write, base_call in (
+    (write_ram, "WebServer::_currentClientWrite(buffer, length)"),
+    (write_flash, "WebServer::_currentClientWrite_P(buffer, length)"),
+):
+    assert write.index(base_call) < write.index("markStationRequest();")
+    assert write.index("written == length") < write.index("markStationRequest();")
+    assert "return written;" in write
+request_auth = source[
+    source.index("bool currentRequestUsesSetupAp()") : source.index("String macString()")
+]
+assert "server.client().localIP()" in request_auth
+assert "isSetupApIngress(" in request_auth
+assert "currentRequestUsesSetupAp() ||" in request_auth
+assert "hasAppAuthorization()" in request_auth
+wifi_start = source[
+    source.index("void startWifi()") : source.index("void maintainWifi()")
+]
+assert "stationHttpClaimed = false;" in wifi_start
+assert "if (staticNetworkEnabled" in wifi_start
+assert "WiFi.config(staticIp, staticGateway, staticSubnet, staticDns, staticDns)" in wifi_start
+assert "if (staticNetworkEnabled) startSetupAp();" in wifi_start
+assert "WiFi.begin(ssid.c_str(), password.c_str());" in wifi_start
+wifi_maintain = source[
+    source.index("void maintainWifi()") : source.index("bool sendDenon(")
+]
+assert "shouldStopSetupAp(staticNetworkEnabled, stationHttpClaimed)" in wifi_maintain
+assert wifi_maintain.index("stopSetupAp();") < wifi_maintain.index("startSetupAp();")
+assert "if (staticNetworkEnabled) stationHttpClaimed = false;" in wifi_maintain
+wifi_save = source[source.index("void saveWifi()") : source.index("void saveNetwork()")]
+assert "if (!currentRequestUsesSetupAp())" in wifi_save
+assert "requireProvisioningAuthorization()" not in wifi_save
+assert "apiClaimWindowOpen()" not in wifi_save
+assert wifi_save.index("currentRequestUsesSetupAp()") < wifi_save.index('server.arg("ssid")')
+assert 'server.arg("preferred_ip")' in wifi_save
+assert "NetworkStorageState desired = readNetworkStorage();" in wifi_save
+assert "desired.value[kPendingIpKey] = preferred.toString();" in wifi_save
+assert "commitNetworkStorage(desired)" in wifi_save
+assert "previous settings restored" in wifi_save
+network_save = source[source.index("void saveNetwork()") : source.index("void clearNetwork()")]
+assert "requireProvisioningAuthorization()" in network_save
+assert 'parseIpv4(server.arg("ip"), preferred)' in network_save
+for runtime_value in ("WiFi.gatewayIP()", "WiFi.subnetMask()", "WiFi.dnsIP(0)"):
+    assert runtime_value in network_save
+assert "validStaticNetwork(preferred, gateway, subnet, dns)" in network_save
+assert "persistStaticNetwork(preferred, gateway, subnet, dns)" in network_save
+network_clear = source[source.index("void clearNetwork()") : source.index("void setupWeb()")]
+assert "requireProvisioningAuthorization()" in network_clear
+assert "if (!clearStaticNetworkStorage())" in network_clear
+assert "previous settings restored" in network_clear
 assert 'constexpr char kMdnsService[] = "denon-volume";' in source
 assert 'MDNS.addServiceTxt(kMdnsService, "tcp", "id", deviceId.c_str());' in source
 web = source[source.index("void setupWeb()") : source.index("void setup()")]
-for route in ("/api/info", "/api/pair", "/api/app", "/api/apps"):
+for route in ("/api/info", "/api/pair", "/api/app", "/api/apps", "/api/network"):
     assert f'server.on("{route}"' in web
+assert r'\"network_mode\":' in source
 assert "server.collectHeaders(headers, 1);" in web
 receive_app = source[source.index("void receiveApp()") : source.index("void sendApps()")]
 assert "hasAppAuthorization()" in receive_app
 assert 'parseAppJson(server.arg("plain"), appId, appName)' in receive_app
 assert "queueAppCandidate(appId, appName);" in receive_app
-assert setup.index("appStateSelfCheck()") < setup.index('preferences.begin("denon", false)')
+assert setup.index("networkSelfCheck()") < setup.index('preferences.begin("denon", false)')
 assert setup.index("loadDeviceIdentity();") < setup.index("loadAppVolumes();") < setup.index(
     "startWifi();"
 )

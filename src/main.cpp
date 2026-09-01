@@ -54,7 +54,45 @@ constexpr uint8_t kGetStatus[] = {0x41, 0x54, 0x00, 0x06, 0x00, 0x00};
 BluetoothSerial serialBt;
 DNSServer dnsServer;
 Preferences preferences;
-WebServer server(kHttpPort);
+bool stationHttpClaimed = false;
+
+bool isSetupApIngress(bool apRunning, bool matchesAp, bool matchesStation) {
+  return apRunning && matchesAp && !matchesStation;
+}
+
+bool isStationIngress(bool connected, bool matchesStation, bool matchesAp) {
+  return connected && matchesStation && !matchesAp;
+}
+
+class StationAwareWebServer : public WebServer {
+ public:
+  explicit StationAwareWebServer(int port) : WebServer(port) {}
+
+ protected:
+  size_t _currentClientWrite(const char *buffer, size_t length) override {
+    const size_t written = WebServer::_currentClientWrite(buffer, length);
+    if (length > 0 && written == length) markStationRequest();
+    return written;
+  }
+
+  size_t _currentClientWrite_P(PGM_P buffer, size_t length) override {
+    const size_t written = WebServer::_currentClientWrite_P(buffer, length);
+    if (length > 0 && written == length) markStationRequest();
+    return written;
+  }
+
+ private:
+  void markStationRequest() {
+    const IPAddress localAddress = _currentClient.localIP();
+    if (isStationIngress(WiFi.status() == WL_CONNECTED,
+                         localAddress == WiFi.localIP(),
+                         localAddress == WiFi.softAPIP())) {
+      stationHttpClaimed = true;
+    }
+  }
+};
+
+StationAwareWebServer server(kHttpPort);
 
 struct StoredAppVolume {
   uint32_t magic = 0;
@@ -79,6 +117,11 @@ String pendingAppName;
 unsigned long pendingAppAt = 0;
 unsigned long apiClaimUntil = 0;
 bool wifiWasConnected = false;
+bool staticNetworkEnabled = false;
+IPAddress staticIp;
+IPAddress staticGateway;
+IPAddress staticSubnet;
+IPAddress staticDns;
 int restoreTargetRaw = -1;
 bool restoreAwaitingFeedback = false;
 bool restoreStatusRequested = false;
@@ -122,8 +165,8 @@ const char kPage[] PROGMEM = R"HTML(
 <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Denon volume</title><style>
 body{font-family:system-ui,sans-serif;max-width:34rem;margin:2rem auto;padding:0 1rem;background:#111;color:#f4f4f4}main{background:#1d1d1d;border-radius:1rem;padding:1.25rem}button,input{box-sizing:border-box;font:inherit;border-radius:.65rem;padding:.8rem;border:0}button{background:#e9b949;color:#111;font-weight:700;min-width:5rem}button:disabled{opacity:.45}.row{display:flex;gap:.75rem;align-items:center;justify-content:center;margin:1rem 0}.volume{font-size:3.5rem;text-align:center}.muted{color:#aaa;font-size:.9rem;text-align:center}.note{color:#bbb;font-size:.9rem;line-height:1.4}form{display:grid;gap:.6rem;margin-top:1rem}input{display:block;width:100%;margin-top:.25rem}#devices button{width:100%;margin-top:.4rem;text-align:left;background:#ddd;overflow-wrap:anywhere;white-space:normal}section{border-top:1px solid #444;margin-top:1.25rem;padding-top:.75rem}.secondary{background:#555;color:#fff;width:100%;margin-top:.6rem}.pairing{text-align:center;border:2px solid #e9b949;border-radius:.75rem;padding:1rem;margin-top:1rem}.pairing-number{font-size:3rem;font-weight:800;letter-spacing:.12em;margin:.4rem 0;color:#e9b949}.pairing-action{font-size:1.15rem;font-weight:700}table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:.55rem .3rem;border-bottom:1px solid #444}th:nth-child(n+2),td:nth-child(n+2){text-align:right}.active{color:#e9b949;font-weight:700}
-</style><main><h1>Denon volume</h1><p id=connection class=muted>Starting…</p><div id=volume class=volume>—</div><p id=db class=muted></p><div class=row><button onclick="send('down')" disabled>−</button><button onclick="send('up')" disabled>+</button></div><section id=receiver><p class=note>On the Denon remote, hold <b>Bluetooth</b> for 3 seconds until Pairing appears, then select the receiver below. When the same six-digit number appears here and on the Denon, confirm it on the receiver. Set Bluetooth Auto-Select to Off if this control connection should not change inputs.</p><button id=scan onclick=scan()>Find receiver</button><div id=devices></div><div id=pairing-confirm class=pairing hidden><p>Confirm this number matches the Denon:</p><div id=pairing-number class=pairing-number></div><p class=pairing-action>Press ENTER on the Denon now</p><p class=note>The ESP32 has already accepted this number. No phone confirmation is needed.</p></div><p id=pairing-message class=note></p><button id=retry class=secondary onclick=retryReceiver() hidden>Retry pairing</button><button id=forget class=secondary onclick=forgetReceiver() hidden>Forget receiver</button></section><section><h2>App volume memory</h2><p id=app-status class=note>Waiting for Home Assistant…</p><table><thead><tr><th>App</th><th>Volume</th><th>dB</th></tr></thead><tbody id=apps></tbody></table></section><section id=wifi><form onsubmit=saveWifi(event)><label>Wi-Fi name<input id=ssid required maxlength=32 autocomplete=off></label><label>Wi-Fi password<input id=password type=password maxlength=63></label><button>Save Wi-Fi</button></form></section></main><script>
-const q=s=>document.querySelector(s);let provisioning=false;const pairingMessages={waiting:'Waiting for the Denon pairing number…',confirm_on_denon:'Confirm the matching number on the Denon.',timed_out:'Pairing attempt ended. Put the Denon in pairing mode, then tap Retry pairing.'};async function api(url,opt){let r=await fetch(url,opt);if(!r.ok)throw Error(await r.text());return r.status===204?null:r.json()}async function send(dir){try{await api('/api/volume/'+dir,{method:'POST'});setTimeout(state,300)}catch(e){alert(e.message)}}async function state(){if(provisioning)return;try{let s=await api('/api/state');q('#connection').textContent=s.connected?'Receiver connected':s.connecting?'Connecting to receiver…':s.receiver_configured?'Receiver disconnected':'Select a receiver';q('#volume').textContent=s.volume===null?'—':s.volume;q('#db').textContent=s.volume_db===null?'':s.volume_db+' dB';document.querySelectorAll('.row button').forEach(b=>b.disabled=!s.connected);q('#scan').hidden=s.receiver_configured;q('#retry').hidden=!s.receiver_configured||s.connected||s.connecting;q('#retry').textContent=s.receiver_bonded?'Retry connection':'Retry pairing';q('#forget').hidden=!s.receiver_configured;q('#wifi').hidden=!s.setup_ap;let confirming=s.pairing_status==='confirm_on_denon'&&s.pairing_number;q('#pairing-confirm').hidden=!confirming;q('#pairing-number').textContent=confirming?s.pairing_number:'';q('#pairing-message').textContent=pairingMessages[s.pairing_status]||''}catch(e){q('#connection').textContent='ESP32 unavailable'}}async function appTable(){if(provisioning)return;try{let j=await api('/api/apps');q('#apps').replaceChildren(...j.apps.map(x=>{let r=document.createElement('tr'),n=document.createElement('td'),v=document.createElement('td'),d=document.createElement('td');n.textContent=(x.active?'● ':'')+(x.app_name||x.app_id);if(x.active)n.className='active';v.textContent=x.volume;d.textContent=x.volume_db;r.append(n,v,d);return r}));q('#app-status').textContent=j.restoring?'Restoring saved volume…':j.apps.length?'Volumes update after manual changes.':'Waiting for Home Assistant…'}catch(e){q('#app-status').textContent='App memory unavailable'}}async function scan(){let d=q('#devices');d.textContent='Scanning Bluetooth for 8 seconds…';try{let j=await api('/api/discover');d.replaceChildren(...j.devices.map(x=>{let b=document.createElement('button');b.textContent=(x.name||'Bluetooth device')+' '+x.mac;b.onclick=()=>receiver(x.mac);return b}));if(!j.devices.length)d.textContent='No devices found. Check Denon pairing mode and try again.'}catch(e){d.textContent=e.message}}async function receiver(mac){try{await api('/api/denon',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)});q('#devices').textContent='Saved. Connecting…';state()}catch(e){alert(e.message)}}async function retryReceiver(){try{await api('/api/denon/reconnect',{method:'POST'});state()}catch(e){alert(e.message)}}async function forgetReceiver(){if(!confirm('Forget the saved receiver?'))return;await fetch('/api/denon',{method:'DELETE'});q('#connection').textContent='Restarting…'}async function saveWifi(e){e.preventDefault();try{let r=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(q('#ssid').value)+'&password='+encodeURIComponent(q('#password').value)});if(!r.ok)throw Error(await r.text());provisioning=true;q('#wifi').hidden=true;q('#connection').textContent='Wi-Fi saved. Rejoin your home Wi-Fi. Home Assistant will discover this ESP32.'}catch(e){alert(e.message)}}state();appTable();setInterval(()=>{state();appTable()},1000);
+</style><main><h1>Denon volume</h1><p id=connection class=muted>Starting…</p><div id=volume class=volume>—</div><p id=db class=muted></p><div class=row><button onclick="send('down')" disabled>−</button><button onclick="send('up')" disabled>+</button></div><section id=receiver><p class=note>On the Denon remote, hold <b>Bluetooth</b> for 3 seconds until Pairing appears, then select the receiver below. When the same six-digit number appears here and on the Denon, confirm it on the receiver. Set Bluetooth Auto-Select to Off if this control connection should not change inputs.</p><button id=scan onclick=scan()>Find receiver</button><div id=devices></div><div id=pairing-confirm class=pairing hidden><p>Confirm this number matches the Denon:</p><div id=pairing-number class=pairing-number></div><p class=pairing-action>Press ENTER on the Denon now</p><p class=note>The ESP32 has already accepted this number. No phone confirmation is needed.</p></div><p id=pairing-message class=note></p><button id=retry class=secondary onclick=retryReceiver() hidden>Retry pairing</button><button id=forget class=secondary onclick=forgetReceiver() hidden>Forget receiver</button></section><section><h2>App volume memory</h2><p id=app-status class=note>Waiting for Home Assistant…</p><table><thead><tr><th>App</th><th>Volume</th><th>dB</th></tr></thead><tbody id=apps></tbody></table></section><section id=wifi><form onsubmit=saveWifi(event)><label>Wi-Fi name<input id=ssid required maxlength=32 autocomplete=off></label><label>Wi-Fi password<input id=password type=password maxlength=63></label><label>Preferred IP address (optional)<input id=preferred-ip inputmode=decimal maxlength=15 placeholder="Leave blank for DHCP" autocomplete=off></label><button>Save Wi-Fi</button></form></section></main><script>
+const q=s=>document.querySelector(s);let provisioning=false;const pairingMessages={waiting:'Waiting for the Denon pairing number…',confirm_on_denon:'Confirm the matching number on the Denon.',timed_out:'Pairing attempt ended. Put the Denon in pairing mode, then tap Retry pairing.'};async function api(url,opt){let r=await fetch(url,opt);if(!r.ok)throw Error(await r.text());return r.status===204?null:r.json()}async function send(dir){try{await api('/api/volume/'+dir,{method:'POST'});setTimeout(state,300)}catch(e){alert(e.message)}}async function state(){if(provisioning)return;try{let s=await api('/api/state');q('#connection').textContent=s.connected?'Receiver connected':s.connecting?'Connecting to receiver…':s.receiver_configured?'Receiver disconnected':'Select a receiver';q('#volume').textContent=s.volume===null?'—':s.volume;q('#db').textContent=s.volume_db===null?'':s.volume_db+' dB';document.querySelectorAll('.row button').forEach(b=>b.disabled=!s.connected);q('#scan').hidden=s.receiver_configured;q('#retry').hidden=!s.receiver_configured||s.connected||s.connecting;q('#retry').textContent=s.receiver_bonded?'Retry connection':'Retry pairing';q('#forget').hidden=!s.receiver_configured;q('#wifi').hidden=!s.setup_ap;let confirming=s.pairing_status==='confirm_on_denon'&&s.pairing_number;q('#pairing-confirm').hidden=!confirming;q('#pairing-number').textContent=confirming?s.pairing_number:'';q('#pairing-message').textContent=pairingMessages[s.pairing_status]||''}catch(e){q('#connection').textContent='ESP32 unavailable'}}async function appTable(){if(provisioning)return;try{let j=await api('/api/apps');q('#apps').replaceChildren(...j.apps.map(x=>{let r=document.createElement('tr'),n=document.createElement('td'),v=document.createElement('td'),d=document.createElement('td');n.textContent=(x.active?'● ':'')+(x.app_name||x.app_id);if(x.active)n.className='active';v.textContent=x.volume;d.textContent=x.volume_db;r.append(n,v,d);return r}));q('#app-status').textContent=j.restoring?'Restoring saved volume…':j.apps.length?'Volumes update after manual changes.':'Waiting for Home Assistant…'}catch(e){q('#app-status').textContent='App memory unavailable'}}async function scan(){let d=q('#devices');d.textContent='Scanning Bluetooth for 8 seconds…';try{let j=await api('/api/discover');d.replaceChildren(...j.devices.map(x=>{let b=document.createElement('button');b.textContent=(x.name||'Bluetooth device')+' '+x.mac;b.onclick=()=>receiver(x.mac);return b}));if(!j.devices.length)d.textContent='No devices found. Check Denon pairing mode and try again.'}catch(e){d.textContent=e.message}}async function receiver(mac){try{await api('/api/denon',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)});q('#devices').textContent='Saved. Connecting…';state()}catch(e){alert(e.message)}}async function retryReceiver(){try{await api('/api/denon/reconnect',{method:'POST'});state()}catch(e){alert(e.message)}}async function forgetReceiver(){if(!confirm('Forget the saved receiver?'))return;await fetch('/api/denon',{method:'DELETE'});q('#connection').textContent='Restarting…'}async function saveWifi(e){e.preventDefault();try{let r=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(q('#ssid').value)+'&password='+encodeURIComponent(q('#password').value)+'&preferred_ip='+encodeURIComponent(q('#preferred-ip').value)});if(!r.ok)throw Error(await r.text());provisioning=true;q('#wifi').hidden=true;q('#connection').textContent='Wi-Fi saved. Rejoin your home Wi-Fi. Home Assistant will discover this ESP32.'}catch(e){alert(e.message)}}state();appTable();setInterval(()=>{state();appTable()},1000);
 </script>
 )HTML";
 
@@ -148,6 +191,84 @@ bool parseMac(const String &text, uint8_t output[6]) {
 
 bool timeReached(unsigned long now, unsigned long target) {
   return static_cast<long>(now - target) >= 0;
+}
+
+bool parseIpv4(String text, IPAddress &address) {
+  text.trim();
+  uint8_t octets[4] = {};
+  size_t octet = 0;
+  unsigned value = 0;
+  size_t digits = 0;
+  for (size_t i = 0; i <= text.length(); ++i) {
+    const char c = i < text.length() ? text[i] : '.';
+    if (c >= '0' && c <= '9') {
+      value = value * 10 + static_cast<unsigned>(c - '0');
+      if (++digits > 3 || value > 255) return false;
+      continue;
+    }
+    if (c != '.' || digits == 0 || octet >= 4) return false;
+    octets[octet++] = static_cast<uint8_t>(value);
+    value = 0;
+    digits = 0;
+  }
+  if (octet != 4) return false;
+  address = IPAddress(octets[0], octets[1], octets[2], octets[3]);
+  return true;
+}
+
+uint32_t ipv4Value(const IPAddress &address) {
+  return (static_cast<uint32_t>(address[0]) << 24) |
+         (static_cast<uint32_t>(address[1]) << 16) |
+         (static_cast<uint32_t>(address[2]) << 8) |
+         static_cast<uint32_t>(address[3]);
+}
+
+bool isUnicastIpv4(const IPAddress &address) {
+  return address[0] > 0 && address[0] < 224 && address[0] != 127;
+}
+
+bool validStaticNetwork(const IPAddress &ip, const IPAddress &gateway,
+                        const IPAddress &subnet, const IPAddress &dns) {
+  const uint32_t ipValue = ipv4Value(ip);
+  const uint32_t gatewayValue = ipv4Value(gateway);
+  const uint32_t mask = ipv4Value(subnet);
+  const uint32_t hostMask = ~mask;
+  if (!isUnicastIpv4(ip) || !isUnicastIpv4(gateway) || !isUnicastIpv4(dns) ||
+      mask == 0 || mask == UINT32_MAX || (hostMask & (hostMask + 1)) != 0 ||
+      (ipValue & mask) != (gatewayValue & mask)) {
+    return false;
+  }
+  const uint32_t ipHost = ipValue & hostMask;
+  const uint32_t gatewayHost = gatewayValue & hostMask;
+  return ipHost != 0 && ipHost != hostMask && gatewayHost != 0 &&
+         gatewayHost != hostMask && ipValue != gatewayValue;
+}
+
+bool shouldStopSetupAp(bool staticConfigured, bool stationClaimed) {
+  return !staticConfigured || stationClaimed;
+}
+
+bool networkSelfCheck() {
+  IPAddress parsed;
+  IPAddress gateway;
+  IPAddress subnet;
+  IPAddress dns;
+  return parseIpv4("203.0.113.1", gateway) &&
+         parseIpv4("255.255.255.0", subnet) &&
+         parseIpv4("203.0.113.53", dns) &&
+         parseIpv4("203.0.113.7", parsed) && parsed[0] == 203 &&
+         parsed[3] == 7 && validStaticNetwork(parsed, gateway, subnet, dns) &&
+         !validStaticNetwork(gateway, gateway, subnet, dns) &&
+         shouldStopSetupAp(false, false) &&
+         !shouldStopSetupAp(true, false) && shouldStopSetupAp(true, true) &&
+         isSetupApIngress(true, true, false) &&
+         !isSetupApIngress(true, false, true) &&
+         !isSetupApIngress(true, true, true) &&
+         isStationIngress(true, true, false) &&
+         !isStationIngress(true, false, true) &&
+         !parseIpv4("203.0.113", parsed) &&
+         !parseIpv4("203.0.113.256", parsed) &&
+         !parseIpv4("203.0.113.7.extra", parsed);
 }
 
 bool isHexText(const String &value, size_t expectedLength) {
@@ -205,13 +326,20 @@ bool hasAppAuthorization() {
                             "Bearer " + apiToken);
 }
 
+bool currentRequestUsesSetupAp() {
+  const IPAddress localAddress = server.client().localIP();
+  return isSetupApIngress(
+      setupApRunning, localAddress == WiFi.softAPIP(),
+      WiFi.status() == WL_CONNECTED && localAddress == WiFi.localIP());
+}
+
 bool apiClaimWindowOpen() {
-  return setupApRunning ||
+  return currentRequestUsesSetupAp() ||
          (apiClaimUntil != 0 && !timeReached(millis(), apiClaimUntil));
 }
 
 bool requireProvisioningAuthorization() {
-  if (setupApRunning ||
+  if (currentRequestUsesSetupAp() ||
       (apiToken.isEmpty() && apiClaimWindowOpen()) || hasAppAuthorization()) {
     return true;
   }
@@ -296,6 +424,142 @@ void stopSetupAp() {
   setupApRunning = false;
 }
 
+enum NetworkStorageKey : size_t {
+  kWifiSsidKey,
+  kWifiPasswordKey,
+  kStaticIpKey,
+  kStaticGatewayKey,
+  kStaticSubnetKey,
+  kStaticDnsKey,
+  kPendingIpKey,
+  kNetworkStorageKeyCount,
+};
+
+constexpr const char *kNetworkStorageKeys[kNetworkStorageKeyCount] = {
+    "wifi_ssid",  "wifi_password", "static_ip",  "static_gw",
+    "static_mask", "static_dns",    "pending_ip",
+};
+
+struct NetworkStorageState {
+  bool present[kNetworkStorageKeyCount] = {};
+  String value[kNetworkStorageKeyCount];
+};
+
+NetworkStorageState readNetworkStorage() {
+  NetworkStorageState state;
+  for (size_t i = 0; i < kNetworkStorageKeyCount; ++i) {
+    state.present[i] = preferences.isKey(kNetworkStorageKeys[i]);
+    if (state.present[i]) {
+      state.value[i] = preferences.getString(kNetworkStorageKeys[i], "");
+    }
+  }
+  return state;
+}
+
+bool writeNetworkStorage(const NetworkStorageState &state) {
+  for (size_t i = 0; i < kNetworkStorageKeyCount; ++i) {
+    if (!state.present[i]) continue;
+    const size_t written =
+        preferences.putString(kNetworkStorageKeys[i], state.value[i]);
+    if ((!state.value[i].isEmpty() && written == 0) ||
+        !preferences.isKey(kNetworkStorageKeys[i]) ||
+        preferences.getString(kNetworkStorageKeys[i], "") != state.value[i]) {
+      return false;
+    }
+  }
+  for (size_t i = 0; i < kNetworkStorageKeyCount; ++i) {
+    if (state.present[i] || !preferences.isKey(kNetworkStorageKeys[i])) continue;
+    if (!preferences.remove(kNetworkStorageKeys[i]) ||
+        preferences.isKey(kNetworkStorageKeys[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool commitNetworkStorage(const NetworkStorageState &desired) {
+  const NetworkStorageState previous = readNetworkStorage();
+  if (writeNetworkStorage(desired)) return true;
+  if (!writeNetworkStorage(previous)) {
+    Serial.println("Network settings rollback failed");
+  }
+  return false;
+}
+
+bool clearStaticNetworkStorage() {
+  NetworkStorageState desired = readNetworkStorage();
+  for (size_t i = kStaticIpKey; i <= kPendingIpKey; ++i) {
+    desired.present[i] = false;
+    desired.value[i] = "";
+  }
+  if (!commitNetworkStorage(desired)) return false;
+  staticNetworkEnabled = false;
+  return true;
+}
+
+bool persistStaticNetwork(const IPAddress &ip, const IPAddress &gateway,
+                          const IPAddress &subnet, const IPAddress &dns) {
+  NetworkStorageState desired = readNetworkStorage();
+  const String values[] = {ip.toString(), gateway.toString(), subnet.toString(),
+                           dns.toString()};
+  for (size_t i = 0; i < 4; ++i) {
+    desired.present[kStaticIpKey + i] = true;
+    desired.value[kStaticIpKey + i] = values[i];
+  }
+  desired.present[kPendingIpKey] = false;
+  desired.value[kPendingIpKey] = "";
+  if (!commitNetworkStorage(desired)) return false;
+  staticIp = ip;
+  staticGateway = gateway;
+  staticSubnet = subnet;
+  staticDns = dns;
+  staticNetworkEnabled = true;
+  return true;
+}
+
+void loadStaticNetwork() {
+  const String ipText = preferences.getString("static_ip", "");
+  const String gatewayText = preferences.getString("static_gw", "");
+  const String subnetText = preferences.getString("static_mask", "");
+  const String dnsText = preferences.getString("static_dns", "");
+  if (ipText.isEmpty() && gatewayText.isEmpty() && subnetText.isEmpty() &&
+      dnsText.isEmpty()) {
+    return;
+  }
+  if (!parseIpv4(ipText, staticIp) ||
+      !parseIpv4(gatewayText, staticGateway) ||
+      !parseIpv4(subnetText, staticSubnet) ||
+      !parseIpv4(dnsText, staticDns) ||
+      !validStaticNetwork(staticIp, staticGateway, staticSubnet, staticDns)) {
+    staticNetworkEnabled = false;
+    Serial.println("Stored static network configuration is invalid; using DHCP");
+    return;
+  }
+  staticNetworkEnabled = true;
+}
+
+bool finishPendingStaticNetwork() {
+  const String pendingText = preferences.getString("pending_ip", "");
+  if (pendingText.isEmpty()) return false;
+  IPAddress preferred;
+  const IPAddress gateway = WiFi.gatewayIP();
+  const IPAddress subnet = WiFi.subnetMask();
+  const IPAddress dns = WiFi.dnsIP(0);
+  if (!parseIpv4(pendingText, preferred) ||
+      !validStaticNetwork(preferred, gateway, subnet, dns) ||
+      !persistStaticNetwork(preferred, gateway, subnet, dns)) {
+    if (!clearStaticNetworkStorage()) {
+      Serial.println("Could not clear failed preferred network settings");
+    }
+    Serial.println("Preferred IP could not use the DHCP network defaults; staying on DHCP");
+    return false;
+  }
+  Serial.println("Preferred IP saved with DHCP network defaults; restarting");
+  delay(250);
+  ESP.restart();
+  return true;
+}
+
 void startWifi() {
   String ssid = preferences.getString("wifi_ssid", WIFI_SSID);
   String password = preferences.getString("wifi_password", WIFI_PASSWORD);
@@ -305,6 +569,14 @@ void startWifi() {
   }
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostName.c_str());
+  stationHttpClaimed = false;
+  loadStaticNetwork();
+  if (staticNetworkEnabled &&
+      !WiFi.config(staticIp, staticGateway, staticSubnet, staticDns, staticDns)) {
+    staticNetworkEnabled = false;
+    Serial.println("Could not apply static network configuration; using DHCP");
+  }
+  if (staticNetworkEnabled) startSetupAp();
   WiFi.begin(ssid.c_str(), password.c_str());
   wifiStartedAt = millis();
   Serial.printf("Connecting to Wi-Fi %s\n", ssid.c_str());
@@ -314,9 +586,14 @@ void maintainWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     if (!wifiWasConnected) {
       wifiWasConnected = true;
+      if (!staticNetworkEnabled && finishPendingStaticNetwork()) return;
       if (apiToken.isEmpty()) apiClaimUntil = millis() + kApiClaimWindowMs;
     }
-    stopSetupAp();
+    if (shouldStopSetupAp(staticNetworkEnabled, stationHttpClaimed)) {
+      stopSetupAp();
+    } else {
+      startSetupAp();
+    }
     if (!mdnsRunning) {
       mdnsRunning = MDNS.begin(hostName.c_str());
       if (mdnsRunning) {
@@ -333,6 +610,7 @@ void maintainWifi() {
   }
   if (wifiWasConnected) {
     wifiWasConnected = false;
+    if (staticNetworkEnabled) stationHttpClaimed = false;
     wifiStartedAt = millis();
     if (mdnsRunning) {
       MDNS.end();
@@ -1306,8 +1584,9 @@ void sendState() {
   body += ",\"current_app_id\":";
   body += currentAppId.isEmpty() ? "null" : "\"" + jsonEscape(currentAppId) + "\"";
   appendRestoreState(body);
-  body += ",\"ip\":\"" + jsonEscape(ip) + "\",\"hostname\":\"" +
-          jsonEscape(hostName) + ".local\"}";
+  body += ",\"ip\":\"" + jsonEscape(ip) + "\",\"network_mode\":\"" +
+          String(staticNetworkEnabled ? "static" : "dhcp") +
+          "\",\"hostname\":\"" + jsonEscape(hostName) + ".local\"}";
   server.send(200, "application/json", body);
 }
 
@@ -1496,13 +1775,15 @@ void forgetDenon() {
 }
 
 void saveWifi() {
-  if (!setupApRunning) {
+  if (!currentRequestUsesSetupAp()) {
     server.send(403, "text/plain",
                 "Wi-Fi provisioning is only available from the setup access point");
     return;
   }
   const String ssid = server.arg("ssid");
   const String password = server.arg("password");
+  String preferredText = server.arg("preferred_ip");
+  preferredText.trim();
   if (ssid.isEmpty() || ssid.length() > 32) {
     server.send(400, "text/plain", "Wi-Fi name must contain 1 to 32 characters");
     return;
@@ -1511,9 +1792,69 @@ void saveWifi() {
     server.send(400, "text/plain", "Wi-Fi password must be empty or contain 8 to 63 characters");
     return;
   }
-  preferences.putString("wifi_ssid", ssid);
-  preferences.putString("wifi_password", password);
+  IPAddress preferred;
+  if (!preferredText.isEmpty() &&
+      (!parseIpv4(preferredText, preferred) || !isUnicastIpv4(preferred))) {
+    server.send(400, "text/plain", "Preferred IP must be a complete unicast IPv4 address");
+    return;
+  }
+  NetworkStorageState desired = readNetworkStorage();
+  desired.present[kWifiSsidKey] = true;
+  desired.value[kWifiSsidKey] = ssid;
+  desired.present[kWifiPasswordKey] = true;
+  desired.value[kWifiPasswordKey] = password;
+  for (size_t i = kStaticIpKey; i <= kPendingIpKey; ++i) {
+    desired.present[i] = false;
+    desired.value[i] = "";
+  }
+  if (!preferredText.isEmpty()) {
+    desired.present[kPendingIpKey] = true;
+    desired.value[kPendingIpKey] = preferred.toString();
+  }
+  if (!commitNetworkStorage(desired)) {
+    server.send(500, "text/plain",
+                "Could not persist Wi-Fi settings; previous settings restored");
+    return;
+  }
+  staticNetworkEnabled = false;
   server.send(202, "text/plain", "Restarting");
+  delay(250);
+  ESP.restart();
+}
+
+void saveNetwork() {
+  if (!requireProvisioningAuthorization()) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(409, "text/plain", "Connect with DHCP before setting a fixed IP");
+    return;
+  }
+  IPAddress preferred;
+  const IPAddress gateway = WiFi.gatewayIP();
+  const IPAddress subnet = WiFi.subnetMask();
+  const IPAddress dns = WiFi.dnsIP(0);
+  if (!parseIpv4(server.arg("ip"), preferred) ||
+      !validStaticNetwork(preferred, gateway, subnet, dns)) {
+    server.send(400, "text/plain",
+                "IP must be a complete usable IPv4 address on the current subnet");
+    return;
+  }
+  if (!persistStaticNetwork(preferred, gateway, subnet, dns)) {
+    server.send(500, "text/plain", "Could not persist fixed network settings");
+    return;
+  }
+  server.send(202, "text/plain", "Restarting with fixed IP");
+  delay(250);
+  ESP.restart();
+}
+
+void clearNetwork() {
+  if (!requireProvisioningAuthorization()) return;
+  if (!clearStaticNetworkStorage()) {
+    server.send(500, "text/plain",
+                "Could not clear fixed network settings; previous settings restored");
+    return;
+  }
+  server.send(202, "text/plain", "Restarting with DHCP");
   delay(250);
   ESP.restart();
 }
@@ -1537,6 +1878,8 @@ void setupWeb() {
   server.on("/api/denon", HTTP_POST, saveDenon);
   server.on("/api/denon", HTTP_DELETE, forgetDenon);
   server.on("/api/wifi", HTTP_POST, saveWifi);
+  server.on("/api/network", HTTP_POST, saveNetwork);
+  server.on("/api/network", HTTP_DELETE, clearNetwork);
   server.onNotFound([] { server.sendHeader("Location", "/"); server.send(302); });
   server.begin();
 }
@@ -1546,7 +1889,8 @@ void setupWeb() {
 void setup() {
   Serial.begin(115200);
   pinMode(kBootButtonPin, INPUT_PULLUP);
-  if (!protocolSelfCheck() || !appStateSelfCheck() || !jsonSelfCheck()) {
+  if (!protocolSelfCheck() || !appStateSelfCheck() || !jsonSelfCheck() ||
+      !networkSelfCheck()) {
     Serial.println("Firmware self-check failed");
     return;
   }

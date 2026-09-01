@@ -6,5 +6,6 @@
 #define WIFI_PASSWORD ""
 
 // Optional. Leave empty and select the AVR after a Bluetooth scan in the web UI.
-// Network addressing uses DHCP and does not need compile-time configuration.
+// DHCP or a preferred address is configured in the web UI and stored in NVS;
+// never add deployment network values to this file.
 #define DENON_MAC ""

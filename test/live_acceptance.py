@@ -56,6 +56,10 @@ def matches(condition: str, state: dict, raw: int | None = None) -> bool:
         return state.get("receiver_configured") is True and state.get("connected") is False
     if condition == "volume":
         return matches("ready", state) and state.get("volume_raw") == raw
+    if condition == "network-dhcp":
+        return state.get("network_mode") == "dhcp"
+    if condition == "network-static":
+        return state.get("network_mode") == "static"
     raise ValueError(condition)
 
 
@@ -84,6 +88,8 @@ def main() -> int:
             "pairing",
             "forgotten",
             "volume",
+            "network-dhcp",
+            "network-static",
             "esp-cycle",
             "denon-cycle",
         ),
@@ -118,6 +124,8 @@ def main() -> int:
                 "pairing",
                 "forgotten",
                 "volume",
+                "network-dhcp",
+                "network-static",
             ) and matches(args.condition, state, args.raw):
                 return 0
             saw_baseline = saw_baseline or matches("ready", state)

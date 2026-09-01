@@ -53,14 +53,47 @@ populated file must never be committed.
    `Denon-Setup-<DEVICE_ID_PREFIX>` from a phone or computer.
 2. Open the captive portal notification. If it does not appear, open the
    gateway address shown in the connected network's details.
-3. Enter the home Wi-Fi name and password. The ESP32 saves them in its local
-   NVS storage, restarts, and obtains an address through DHCP.
-4. Rejoin the home network. The ESP32 web interface is available at
+3. Enter the home Wi-Fi name and password. **Preferred IP address** is optional:
+   leave it blank to use DHCP, or enter an unused address from the home network
+   to keep the ESP32 at that address across restarts. Reserving the same address
+   in the router avoids another DHCP client receiving it.
+4. The ESP32 saves the choice in local NVS and restarts. For a preferred
+   address, it first takes one DHCP lease to learn the network's gateway, subnet,
+   and DNS settings, saves those runtime values, then restarts once more using
+   the preferred address.
+5. Rejoin the home network. The ESP32 web interface is available at
    `http://denon-volume-<DEVICE_ID_PREFIX>.local/` when mDNS works on the
    network.
 
 If the saved network later becomes unreachable, the setup access point returns
 after about 15 seconds so Wi-Fi can be configured again.
+
+When starting with saved static settings, the recovery access point is available
+immediately and remains available until the ESP32 finishes an HTTP response to a
+request received through its station/static address. Requests made through the
+setup access point do not close it. This proves the saved address is actually
+reachable before removing the recovery path. If a later router or network change
+strands the static address after the access point has closed, power-cycle the
+ESP32 to reopen it.
+
+To change an installed device's preferred address, send the new `ip` to the
+protected local network endpoint. To return to DHCP, delete that configuration:
+
+```sh
+curl -X POST http://<ESP32_HOST>/api/network \
+  -H 'Authorization: Bearer <DEVICE_TOKEN>' \
+  --data-urlencode 'ip=<PREFERRED_IP>'
+
+curl -X DELETE http://<ESP32_HOST>/api/network \
+  -H 'Authorization: Bearer <DEVICE_TOKEN>'
+```
+
+Both operations return `202` and restart the ESP32. If a saved address cannot
+reach the home network, join the recovery access point, use the gateway address
+shown by the phone or computer, and issue `DELETE /api/network` there. While the
+setup access point is running, provisioning requests are allowed without the
+bearer token; the delete clears only fixed and pending network settings. Invalid
+stored settings are ignored and the firmware falls back to DHCP.
 
 ### 2. Pair the Denon receiver
 
@@ -153,8 +186,8 @@ Discovery and status:
 
 - `GET /api/info` returns the product, API version, generated device ID, name,
   hostname, and pairing state.
-- `GET /api/state` returns Wi-Fi, receiver, Bluetooth, volume, active app, and
-  restore state.
+- `GET /api/state` returns Wi-Fi, receiver, Bluetooth, volume, active app,
+  restore state, and `network_mode` (`dhcp` or `static`).
 - `GET /api/apps` returns the bounded per-app volume table.
 - `GET /api/discover` scans for nearby Bluetooth devices for eight seconds.
 
@@ -183,13 +216,31 @@ Receiver and provisioning controls:
 - `DELETE /api/denon` removes only the saved receiver bond and restarts the
   ESP32. It retains Wi-Fi, app memory, and the Home Assistant API token.
 - `POST /api/wifi` with form fields `ssid` and `password` is accepted only while
-  the setup access point is active, then restarts the ESP32.
+  the setup access point is active. Its optional `preferred_ip` field is blank
+  for DHCP or contains a complete unicast IPv4 address. A preferred address is
+  combined with gateway, subnet, and DNS values learned from the first DHCP
+  lease, persisted in NVS, and applied after an automatic second restart.
+- `POST /api/network` with form field `ip` validates a new preferred address
+  against the current network, persists that address plus the live gateway,
+  subnet, and DNS settings, then returns `202` and restarts.
+- `DELETE /api/network` clears only fixed and pending network settings, returns
+  `202`, and restarts using DHCP.
 
-Receiver discovery, selection, and forgetting are accepted only on the setup
-access point, during an unpaired device's ten-minute claim window, or with the
-bearer token. The receiver reconnect and volume buttons remain available on the
-trusted LAN. Denon raw volume values outside `0..196` (display `0.0..98.0`) are
-rejected from both receiver reports and persisted app rows.
+Network-setting writes are transactional across Wi-Fi credentials, static
+address, gateway, subnet, DNS, and a pending preferred address. Every write and
+removal is read back. If a commit fails, firmware attempts to restore the prior
+complete snapshot, returns `500`, and does not restart with a knowingly partial
+configuration.
+
+Receiver discovery, selection, forgetting, and runtime network changes are
+accepted when the request arrives through the setup-access-point interface,
+during an unpaired device's ten-minute claim window, or with the bearer token.
+Merely running the recovery access point does not authorize a simultaneous
+station-interface request; that path still needs the bearer token. If interface
+addresses ever collide, setup bypass fails closed. The receiver reconnect and
+volume buttons remain available on the trusted LAN. Denon raw volume values
+outside `0..196` (display `0.0..98.0`) are rejected from both receiver reports
+and persisted app rows.
 
 The device uses local plain HTTP. The bearer token protects app updates and
 provisioning mutations, but the web UI, status, reconnect, and volume controls
@@ -244,6 +295,9 @@ deployment address:
 ```sh
 DENON_URL=http://<ESP32_HOST> .venv/bin/python test/live_acceptance.py ready \
   --label <TEST_LABEL> --evidence <EVIDENCE_PATH>
+
+DENON_URL=http://<ESP32_HOST> .venv/bin/python test/live_acceptance.py \
+  network-static --label <TEST_LABEL> --evidence <EVIDENCE_PATH>
 ```
 
 ## Compatibility and privacy
