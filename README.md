@@ -1,9 +1,10 @@
 # Denon App Volume
 
-Denon App Volume remembers a separate receiver volume for each Apple TV app.
-When Home Assistant reports a new app, the ESP32 saves the outgoing app's
-volume and restores the last volume recorded for the incoming app. Manual
-volume changes become that app's new saved value.
+Denon App Volume remembers a separate receiver volume for each Apple TV app
+that Home Assistant identifies during playback. When Home Assistant reports a
+new app, the ESP32 saves the outgoing app's volume and restores the last volume
+recorded for the incoming app. Manual volume changes become that app's new
+saved value.
 
 The project has two parts:
 
@@ -12,9 +13,9 @@ Apple TV -> Home Assistant custom integration -> local HTTP -> ESP32
 ESP32 -> Bluetooth Classic SPP -> Denon receiver
 ```
 
-The ESP32 owns the volume table and the restore loop. Home Assistant only sends
-the current Apple TV `app_id` and display name. There is no cloud service or
-external database.
+The ESP32 owns the volume table and the restore loop. Home Assistant sends the
+Apple TV `app_id` and display name when they are available, and keeps a local
+backup of the table. There is no cloud service or external database.
 
 ## Requirements
 
@@ -151,8 +152,9 @@ Manual host entry also helps when mDNS is blocked across VLANs.
 
 ## Normal operation
 
-Home Assistant sends the usable Apple TV app identity on state changes and as a
-five-second heartbeat. The ESP32 waits briefly for the identity to settle, then:
+Home Assistant sends a known Apple TV playback-app identity on state changes and
+as a five-second heartbeat. The ESP32 waits briefly for the identity to settle,
+then:
 
 - saves the current Denon volume for the outgoing app;
 - restores the incoming app's saved volume one Denon step at a time, waiting
@@ -165,20 +167,36 @@ does not move toward the target, exceeds 196 steps, or runs for 30 seconds.
 `GET /api/state` and `GET /api/apps` expose `restore_state` (`idle`,
 `restoring`, or `error`) and a stable `restore_error` value when it stops.
 
-The ESP32 keeps up to 16 app entries in NVS. When full, it reuses the oldest
-entry. Writes are delayed briefly to reduce flash wear.
+The ESP32 keeps up to 16 app entries in NVS, which survives power loss and
+restart. When full, it reuses the oldest entry. Writes are delayed briefly to
+reduce flash wear.
+
+The Home Assistant integration also mirrors the table to its native persistent
+`Store`. The ESP32 remains the primary copy: a non-empty device table replaces
+the Home Assistant backup, while an empty or replacement ESP32 receives the
+existing backup. Unchanged five-second polls do not write to Home Assistant's
+disk; changed snapshots are saved after a short delay.
 
 Open `http://denon-volume-<DEVICE_ID_PREFIX>.local/` to see the live connection
 state, current receiver volume, pairing controls, and the per-app volume table.
 
 ### Apple TV app identity limitation
 
-This depends on the Apple TV integration's `app_id` attribute. Apple TV commonly
-reports it while an app is playing media, not merely because the app is open in
-the foreground. An empty ID means no app is playing and clears the active app
-without changing its stored row. `unknown`, `unavailable`, and other transient
-identities are ignored, so opening an app without starting playback may not
-trigger a volume switch.
+This uses the official [Home Assistant Apple TV
+integration](https://www.home-assistant.io/integrations/apple_tv/) and its
+`app_id`/`app_name` attributes. An identity supplied while media is playing or
+paused is exact. When a responsive Apple TV state loses `app_id`, Home Assistant
+sends an explicit clear. The ESP32 stops attributing later volume changes to the
+previous app but retains its saved row. A truly `unknown` or `unavailable`
+entity sends nothing; the last known ownership is preserved until the entity
+returns.
+
+The stock integration cannot identify an idle foreground app. Its underlying
+[pyatv app API](https://github.com/postlund/pyatv/blob/master/pyatv/interface.py#L3451-L3467)
+explicitly reports the app playing media, not the app merely active on screen.
+Consequently, opening YouTube or Netflix without playback does not trigger a
+volume switch. Tracking an app merely because Home Assistant launched it is not
+implemented.
 
 ## Local API
 
@@ -189,6 +207,9 @@ Discovery and status:
 - `GET /api/state` returns Wi-Fi, receiver, Bluetooth, volume, active app,
   restore state, and `network_mode` (`dhcp` or `static`).
 - `GET /api/apps` returns the bounded per-app volume table.
+- `GET /api/backup` returns a versioned app-volume snapshot and `ETag`. It
+  requires `Authorization: Bearer <DEVICE_TOKEN>` and sends `Cache-Control:
+  no-store`.
 - `GET /api/discover` scans for nearby Bluetooth devices for eight seconds.
 
 Pairing and app updates:
@@ -205,6 +226,10 @@ Pairing and app updates:
   `202 {"accepted":true,"cleared":true}`. A non-empty accepted ID returns
   `202`, an ignored transient identity returns `204`, malformed JSON or
   non-string fields return `400`, and a missing or invalid token returns `401`.
+- `PUT /api/backup` restores a validated versioned snapshot only when the
+  device table is empty. It requires the bearer token and the `ETag` from a
+  preceding `GET /api/backup` in `If-Match`, rejects concurrent changes, and
+  commits to NVS before switching the active table.
 - `POST /api/unpair` requires the same bearer token, clears only that token,
   opens a new ten-minute claim window, and returns `204`.
 
@@ -308,5 +333,5 @@ pair but are not supported until the protocol is verified on real hardware.
 
 The repository contains no deployment IP address, MAC address, Home Assistant
 entity ID, access token, or Wi-Fi credential. Runtime values live only in the
-ESP32 NVS or the Home Assistant config entry. CI runs both the repository secret
-scanner and gitleaks to catch accidental additions.
+ESP32 NVS or Home Assistant's private config and storage data. CI runs both the
+repository secret scanner and gitleaks to catch accidental additions.

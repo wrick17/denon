@@ -42,6 +42,7 @@ constexpr uint16_t kRestoreMaxSteps = kMaxVolumeRaw;
 constexpr size_t kMaxApps = 16;
 constexpr size_t kMaxAppIdLength = 96;
 constexpr size_t kMaxAppNameLength = 64;
+constexpr size_t kMaxBackupBodyLength = 24576;
 constexpr uint32_t kStoredAppMagic = 0x44564131;  // DVA1
 
 constexpr uint8_t kVolumeUp[] = {0x41, 0x54, 0x07, 0x00, 0x00, 0x00};
@@ -106,6 +107,7 @@ StoredAppVolume appVolumes[kMaxApps];
 bool appDirty[kMaxApps] = {};
 unsigned long appPersistAt[kMaxApps] = {};
 uint32_t appSequence = 0;
+uint8_t activeAppBank = 0;
 String deviceId;
 String hostName;
 String setupApName;
@@ -625,8 +627,13 @@ bool sendDenon(const uint8_t *command, size_t length) {
   return serialBt.write(command, length) == length;
 }
 
-void appStorageKey(size_t index, char key[7]) {
-  snprintf(key, 7, "app%02u", static_cast<unsigned>(index));
+void appStorageKey(uint8_t bank, size_t index, char key[7]) {
+  snprintf(key, 7, bank == 0 ? "app%02u" : "bak%02u",
+           static_cast<unsigned>(index));
+}
+
+const char *appSequenceKey(uint8_t bank) {
+  return bank == 0 ? "app_seq" : "bak_seq";
 }
 
 void copyText(char *destination, size_t capacity, const String &value) {
@@ -637,10 +644,15 @@ void copyText(char *destination, size_t capacity, const String &value) {
 }
 
 void loadAppVolumes() {
-  appSequence = preferences.getUInt("app_seq", 0);
+  activeAppBank = preferences.getUChar("app_bank", 0);
+  if (activeAppBank > 1) {
+    Serial.println("Stored app bank is invalid; using the original table");
+    activeAppBank = 0;
+  }
+  appSequence = preferences.getUInt(appSequenceKey(activeAppBank), 0);
   for (size_t i = 0; i < kMaxApps; ++i) {
     char key[7];
-    appStorageKey(i, key);
+    appStorageKey(activeAppBank, i, key);
     StoredAppVolume stored;
     if (preferences.getBytesLength(key) != sizeof(stored) ||
         preferences.getBytes(key, &stored, sizeof(stored)) != sizeof(stored) ||
@@ -658,7 +670,7 @@ void loadAppVolumes() {
 bool persistApp(size_t index) {
   if (index >= kMaxApps || appVolumes[index].appId[0] == '\0') return false;
   char key[7];
-  appStorageKey(index, key);
+  appStorageKey(activeAppBank, index, key);
   appVolumes[index].magic = kStoredAppMagic;
   if (preferences.putBytes(key, &appVolumes[index], sizeof(appVolumes[index])) !=
       sizeof(appVolumes[index])) {
@@ -666,7 +678,7 @@ bool persistApp(size_t index) {
                   static_cast<unsigned>(index));
     return false;
   }
-  preferences.putUInt("app_seq", appSequence);
+  preferences.putUInt(appSequenceKey(activeAppBank), appSequence);
   appDirty[index] = false;
   return true;
 }
@@ -1383,14 +1395,334 @@ bool parseAppJson(const String &json, String &appId, String &appName) {
   return position == json.length() && hasAppId && hasAppName;
 }
 
+bool parseJsonUnsigned(const String &json, size_t &position, uint32_t &value) {
+  if (position >= json.length() || json[position] < '0' ||
+      json[position] > '9') {
+    return false;
+  }
+  if (json[position] == '0' && position + 1 < json.length() &&
+      json[position + 1] >= '0' && json[position + 1] <= '9') {
+    return false;
+  }
+  uint32_t parsed = 0;
+  do {
+    const uint8_t digit = static_cast<uint8_t>(json[position++] - '0');
+    if (parsed > (UINT32_MAX - digit) / 10) return false;
+    parsed = parsed * 10 + digit;
+  } while (position < json.length() && json[position] >= '0' &&
+           json[position] <= '9');
+  value = parsed;
+  return true;
+}
+
+bool validBackupText(const String &appId, const String &appName) {
+  return !appId.isEmpty() && appId.length() <= kMaxAppIdLength &&
+         appName.length() <= kMaxAppNameLength;
+}
+
+bool parseBackupApp(const String &json, size_t &position,
+                    StoredAppVolume &app) {
+  bool hasAppId = false;
+  bool hasAppName = false;
+  bool hasVolumeRaw = false;
+  String appId;
+  String appName;
+  uint32_t volumeRaw = 0;
+  if (position >= json.length() || json[position++] != '{') return false;
+  skipJsonWhitespace(json, position);
+  while (position < json.length() && json[position] != '}') {
+    String key;
+    if (!parseJsonString(json, position, key)) return false;
+    skipJsonWhitespace(json, position);
+    if (position >= json.length() || json[position++] != ':') return false;
+    skipJsonWhitespace(json, position);
+    if (key == "app_id" && !hasAppId) {
+      if (!parseJsonString(json, position, appId)) return false;
+      hasAppId = true;
+    } else if (key == "app_name" && !hasAppName) {
+      if (!parseJsonString(json, position, appName)) return false;
+      hasAppName = true;
+    } else if (key == "volume_raw" && !hasVolumeRaw) {
+      if (!parseJsonUnsigned(json, position, volumeRaw) ||
+          volumeRaw > kMaxVolumeRaw) {
+        return false;
+      }
+      hasVolumeRaw = true;
+    } else {
+      return false;
+    }
+    skipJsonWhitespace(json, position);
+    if (position < json.length() && json[position] == ',') {
+      ++position;
+      skipJsonWhitespace(json, position);
+      if (position >= json.length() || json[position] == '}') return false;
+    } else {
+      break;
+    }
+  }
+  if (position >= json.length() || json[position++] != '}' || !hasAppId ||
+      !hasAppName || !hasVolumeRaw || !validBackupText(appId, appName)) {
+    return false;
+  }
+  app = {};
+  app.magic = kStoredAppMagic;
+  app.raw = static_cast<uint8_t>(volumeRaw);
+  copyText(app.appId, sizeof(app.appId), appId);
+  copyText(app.appName, sizeof(app.appName), appName);
+  return true;
+}
+
+bool parseBackupApps(const String &json, size_t &position,
+                     StoredAppVolume apps[kMaxApps], size_t &count) {
+  if (position >= json.length() || json[position++] != '[') return false;
+  count = 0;
+  skipJsonWhitespace(json, position);
+  if (position < json.length() && json[position] == ']') {
+    ++position;
+    return true;
+  }
+  while (position < json.length()) {
+    if (count >= kMaxApps || !parseBackupApp(json, position, apps[count])) {
+      return false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+      if (strcmp(apps[i].appId, apps[count].appId) == 0) return false;
+    }
+    ++count;
+    skipJsonWhitespace(json, position);
+    if (position < json.length() && json[position] == ',') {
+      ++position;
+      skipJsonWhitespace(json, position);
+      if (position >= json.length() || json[position] == ']') return false;
+      continue;
+    }
+    if (position >= json.length() || json[position++] != ']') return false;
+    return true;
+  }
+  return false;
+}
+
+bool parseBackupJson(const String &json, StoredAppVolume apps[kMaxApps],
+                     size_t &count) {
+  size_t position = 0;
+  bool hasSchema = false;
+  bool hasApps = false;
+  uint32_t schema = 0;
+  skipJsonWhitespace(json, position);
+  if (position >= json.length() || json[position++] != '{') return false;
+  skipJsonWhitespace(json, position);
+  while (position < json.length() && json[position] != '}') {
+    String key;
+    if (!parseJsonString(json, position, key)) return false;
+    skipJsonWhitespace(json, position);
+    if (position >= json.length() || json[position++] != ':') return false;
+    skipJsonWhitespace(json, position);
+    if (key == "schema" && !hasSchema) {
+      if (!parseJsonUnsigned(json, position, schema)) return false;
+      hasSchema = true;
+    } else if (key == "apps" && !hasApps) {
+      if (!parseBackupApps(json, position, apps, count)) return false;
+      hasApps = true;
+    } else {
+      return false;
+    }
+    skipJsonWhitespace(json, position);
+    if (position < json.length() && json[position] == ',') {
+      ++position;
+      skipJsonWhitespace(json, position);
+      if (position >= json.length() || json[position] == '}') return false;
+    } else {
+      break;
+    }
+  }
+  if (position >= json.length() || json[position++] != '}' || !hasSchema ||
+      !hasApps || schema != 1) {
+    return false;
+  }
+  skipJsonWhitespace(json, position);
+  return position == json.length();
+}
+
 bool jsonSelfCheck() {
   String appId;
   String appName;
+  StoredAppVolume apps[kMaxApps];
+  size_t count = 0;
   return parseAppJson(
              "{\"app_id\":\"com.example.video\",\"app_name\":\"Video\"}",
              appId, appName) &&
          appId == "com.example.video" && appName == "Video" &&
-         !parseAppJson("{\"app_id\":\"bad\",}", appId, appName);
+         !parseAppJson("{\"app_id\":\"bad\",}", appId, appName) &&
+         parseBackupJson(
+             "{\"schema\":1,\"apps\":[{\"app_id\":\"one\","
+             "\"app_name\":\"One\",\"volume_raw\":100},{\"app_id\":"
+             "\"two\",\"app_name\":\"Two\",\"volume_raw\":101}]}",
+             apps, count) &&
+         count == 2 && strcmp(apps[0].appId, "one") == 0 &&
+         apps[1].raw == 101 &&
+         !parseBackupJson(
+             "{\"schema\":1,\"apps\":[{\"app_id\":\"one\","
+             "\"app_name\":\"One\",\"volume_raw\":197}]}",
+             apps, count) &&
+         !parseBackupJson(
+             "{\"schema\":1,\"apps\":[{\"app_id\":\"one\","
+             "\"app_name\":\"One\",\"volume_raw\":1},{\"app_id\":"
+             "\"one\",\"app_name\":\"Again\",\"volume_raw\":2}]}",
+             apps, count);
+}
+
+bool appTableEmpty() {
+  for (const StoredAppVolume &app : appVolumes) {
+    if (app.appId[0] != '\0') return false;
+  }
+  return true;
+}
+
+String backupEtag() { return "\"" + String(appSequence) + "\""; }
+
+size_t orderedAppIndices(size_t indices[kMaxApps]) {
+  size_t count = 0;
+  for (size_t i = 0; i < kMaxApps; ++i) {
+    if (appVolumes[i].appId[0] == '\0') continue;
+    size_t position = count;
+    while (position > 0 &&
+           appVolumes[indices[position - 1]].sequence >
+               appVolumes[i].sequence) {
+      indices[position] = indices[position - 1];
+      --position;
+    }
+    indices[position] = i;
+    ++count;
+  }
+  return count;
+}
+
+bool writeBackupBank(uint8_t bank,
+                     const StoredAppVolume apps[kMaxApps], size_t count,
+                     uint32_t revision) {
+  for (size_t i = 0; i < count; ++i) {
+    char key[7];
+    appStorageKey(bank, i, key);
+    if (preferences.putBytes(key, &apps[i], sizeof(apps[i])) !=
+        sizeof(apps[i])) {
+      return false;
+    }
+  }
+  for (size_t i = count; i < kMaxApps; ++i) {
+    char key[7];
+    appStorageKey(bank, i, key);
+    if (preferences.isKey(key) && !preferences.remove(key)) return false;
+  }
+  if (preferences.putUInt(appSequenceKey(bank), revision) != sizeof(revision)) {
+    return false;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    char key[7];
+    StoredAppVolume readback;
+    appStorageKey(bank, i, key);
+    if (preferences.getBytesLength(key) != sizeof(readback) ||
+        preferences.getBytes(key, &readback, sizeof(readback)) !=
+            sizeof(readback) ||
+        memcmp(&readback, &apps[i], sizeof(readback)) != 0) {
+      return false;
+    }
+  }
+  for (size_t i = count; i < kMaxApps; ++i) {
+    char key[7];
+    appStorageKey(bank, i, key);
+    if (preferences.isKey(key)) return false;
+  }
+  return preferences.getUInt(appSequenceKey(bank), UINT32_MAX) == revision;
+}
+
+bool commitBackupApps(StoredAppVolume apps[kMaxApps], size_t count) {
+  if (count == 0) return true;
+  uint32_t base = appSequence;
+  if (base > UINT32_MAX - count) base = 0;
+  for (size_t i = 0; i < count; ++i) {
+    apps[i].sequence = base + static_cast<uint32_t>(i) + 1;
+  }
+  const uint32_t revision = base + static_cast<uint32_t>(count);
+  const uint8_t targetBank = activeAppBank == 0 ? 1 : 0;
+  if (!writeBackupBank(targetBank, apps, count, revision)) return false;
+
+  if (preferences.putUChar("app_bank", targetBank) != sizeof(targetBank) ||
+      preferences.getUChar("app_bank", 0xFF) != targetBank) {
+    return false;
+  }
+  memset(appVolumes, 0, sizeof(appVolumes));
+  memcpy(appVolumes, apps, count * sizeof(apps[0]));
+  memset(appDirty, 0, sizeof(appDirty));
+  memset(appPersistAt, 0, sizeof(appPersistAt));
+  activeAppBank = targetBank;
+  appSequence = revision;
+  startRestoreForCurrentApp();
+  return true;
+}
+
+bool requireBackupAuthorization() {
+  if (hasAppAuthorization()) return true;
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("WWW-Authenticate", "Bearer");
+  server.send(401, "text/plain", "Missing or invalid bearer token");
+  return false;
+}
+
+void sendBackup() {
+  if (!requireBackupAuthorization()) return;
+  size_t indices[kMaxApps];
+  const size_t count = orderedAppIndices(indices);
+  String body = "{\"schema\":1,\"revision\":" + String(appSequence) +
+                ",\"apps\":[";
+  for (size_t position = 0; position < count; ++position) {
+    if (position) body += ',';
+    const StoredAppVolume &app = appVolumes[indices[position]];
+    body += "{\"app_id\":\"" + jsonEscape(app.appId) +
+            "\",\"app_name\":\"" + jsonEscape(app.appName) +
+            "\",\"volume_raw\":" + String(app.raw) + "}";
+  }
+  body += "]}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("ETag", backupEtag());
+  server.send(200, "application/json", body);
+}
+
+void restoreBackup() {
+  if (!requireBackupAuthorization()) return;
+  server.sendHeader("Cache-Control", "no-store");
+  const String body = server.arg("plain");
+  if (body.isEmpty() || body.length() > kMaxBackupBodyLength) {
+    server.send(body.isEmpty() ? 400 : 413, "text/plain",
+                body.isEmpty() ? "Expected a JSON backup" :
+                                 "Backup is too large");
+    return;
+  }
+  StoredAppVolume apps[kMaxApps];
+  size_t count = 0;
+  if (!parseBackupJson(body, apps, count)) {
+    server.send(400, "text/plain", "Invalid schema 1 app backup");
+    return;
+  }
+  if (!server.hasHeader("If-Match")) {
+    server.send(428, "text/plain", "If-Match is required");
+    return;
+  }
+  if (server.header("If-Match") != backupEtag()) {
+    server.send(412, "text/plain", "Backup revision changed");
+    return;
+  }
+  if (!appTableEmpty()) {
+    server.send(409, "text/plain", "App volume table is not empty");
+    return;
+  }
+  if (!commitBackupApps(apps, count)) {
+    server.send(500, "text/plain",
+                "Could not persist backup; current table was preserved");
+    return;
+  }
+  server.sendHeader("ETag", backupEtag());
+  server.send(204);
 }
 
 void sendInfo() {
@@ -1860,14 +2192,16 @@ void clearNetwork() {
 }
 
 void setupWeb() {
-  const char *headers[] = {"Authorization"};
-  server.collectHeaders(headers, 1);
+  const char *headers[] = {"Authorization", "If-Match"};
+  server.collectHeaders(headers, 2);
   server.on("/", HTTP_GET, sendPage);
   server.on("/api/info", HTTP_GET, sendInfo);
   server.on("/api/pair", HTTP_POST, pairApi);
   server.on("/api/unpair", HTTP_POST, unpairApi);
   server.on("/api/app", HTTP_POST, receiveApp);
   server.on("/api/apps", HTTP_GET, sendApps);
+  server.on("/api/backup", HTTP_GET, sendBackup);
+  server.on("/api/backup", HTTP_PUT, restoreBackup);
   server.on("/api/state", HTTP_GET, sendState);
   server.on("/api/volume/up", HTTP_POST,
             [] { sendVolume(kVolumeUp, sizeof(kVolumeUp)); });

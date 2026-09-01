@@ -251,10 +251,31 @@ assert "previous settings restored" in network_clear
 assert 'constexpr char kMdnsService[] = "denon-volume";' in source
 assert 'MDNS.addServiceTxt(kMdnsService, "tcp", "id", deviceId.c_str());' in source
 web = source[source.index("void setupWeb()") : source.index("void setup()")]
-for route in ("/api/info", "/api/pair", "/api/app", "/api/apps", "/api/network"):
+for route in (
+    "/api/info",
+    "/api/pair",
+    "/api/app",
+    "/api/apps",
+    "/api/backup",
+    "/api/network",
+):
     assert f'server.on("{route}"' in web
 assert r'\"network_mode\":' in source
-assert "server.collectHeaders(headers, 1);" in web
+assert 'const char *headers[] = {"Authorization", "If-Match"};' in web
+assert "server.collectHeaders(headers, 2);" in web
+backup = source[source.index("bool appTableEmpty()") : source.index("void sendInfo()")]
+assert "hasAppAuthorization()" in backup
+assert "requireProvisioningAuthorization()" not in backup
+assert 'server.header("If-Match") != backupEtag()' in backup
+assert 'server.sendHeader("Cache-Control", "no-store")' in backup
+assert backup.index("writeBackupBank(targetBank") < backup.index(
+    'preferences.putUChar("app_bank", targetBank)'
+)
+assert backup.index('preferences.putUChar("app_bank", targetBank)') < backup.index(
+    "memcpy(appVolumes, apps"
+)
+assert "preferences.getBytes(key, &readback" in backup
+assert "memcmp(&readback, &apps[i]" in backup
 receive_app = source[source.index("void receiveApp()") : source.index("void sendApps()")]
 assert "hasAppAuthorization()" in receive_app
 assert 'parseAppJson(server.arg("plain"), appId, appName)' in receive_app
