@@ -1,0 +1,7 @@
+.DS_Store
+.pio/
+.pio-home/
+.venv/
+__pycache__/
+*.py[cod]
+include/config.h

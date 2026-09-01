@@ -1,0 +1,10 @@
+#pragma once
+
+// Leave these empty to configure Wi-Fi from the ESP32 setup access point.
+// This file is only a template. Never commit populated credentials.
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+
+// Optional. Leave empty and select the AVR after a Bluetooth scan in the web UI.
+// Network addressing uses DHCP and does not need compile-time configuration.
+#define DENON_MAC ""

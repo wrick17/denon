@@ -1,0 +1,12 @@
+{
+  "domain": "denon_app_volume",
+  "name": "Denon App Volume",
+  "codeowners": ["@wrick17"],
+  "config_flow": true,
+  "documentation": "https://github.com/wrick17/denon",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/wrick17/denon/issues",
+  "version": "0.1.0",
+  "zeroconf": ["_denon-volume._tcp.local."]
+}

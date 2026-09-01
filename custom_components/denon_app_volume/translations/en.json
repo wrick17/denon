@@ -1,0 +1,37 @@
+{
+  "title": "Denon App Volume",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Denon App Volume",
+        "description": "Enter the ESP32 host and choose the Apple TV to follow. If the ESP32 joined Wi-Fi more than ten minutes ago, restart it and submit within ten minutes.",
+        "data": {
+          "host": "ESP32 host",
+          "entity_id": "Apple TV media player"
+        }
+      },
+      "zeroconf_confirm": {
+        "title": "Set up {name}",
+        "description": "Choose the Apple TV to follow. If the ESP32 joined Wi-Fi more than ten minutes ago, restart it and submit within ten minutes.",
+        "data": {
+          "entity_id": "Apple TV media player"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Repair ESP32 authentication",
+        "description": "Hold the ESP32 GPIO0/BOOT button for ten seconds, then release it. Wait for the ESP32 to restart, then submit within ten minutes. This resets only the Home Assistant token."
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to the ESP32. Check its power and network connection.",
+      "cannot_pair": "The ESP32 did not pair. Restart it and try again within ten minutes.",
+      "token_reset_required": "The ESP32 already has another token. Hold GPIO0/BOOT for ten seconds, release it, wait for the restart, then try again within ten minutes.",
+      "wrong_device": "The host now points to a different ESP32."
+    },
+    "abort": {
+      "already_configured": "This ESP32 is already configured.",
+      "cannot_connect": "Could not connect to the discovered ESP32.",
+      "reauth_successful": "ESP32 authentication was repaired."
+    }
+  }
+}
