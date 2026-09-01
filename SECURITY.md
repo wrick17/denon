@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Only the latest GitHub release receives security fixes.
+Security fixes are applied to the current master branch and included in future releases.
 
 ## Reporting a vulnerability
 
