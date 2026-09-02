@@ -1,0 +1,22 @@
+[Unit]
+Description=Apple TV foreground app MQTT sensor
+Requires=appletv-tunneld.service
+After=appletv-tunneld.service network-online.target
+
+[Service]
+Type=simple
+User=dietpi
+Group=dietpi
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/appletv-foreground.env
+ExecStart=/opt/appletv-foreground/.venv/bin/python /opt/appletv-foreground/collector.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

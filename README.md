@@ -1,21 +1,25 @@
 # Denon App Volume
 
-Denon App Volume remembers a separate receiver volume for each Apple TV app
-that Home Assistant identifies during playback. When Home Assistant reports a
-new app, the ESP32 saves the outgoing app's volume and restores the last volume
-recorded for the incoming app. Manual volume changes become that app's new
-saved value.
+Denon App Volume remembers a separate receiver volume for each Apple TV app.
+A local foreground collector identifies the app on screen, Home Assistant
+combines that identity with the official Apple TV playback state, and the ESP32
+saves or restores the appropriate Denon volume. Manual receiver-volume changes
+become the active app's new saved value.
 
-The project has two parts:
+The runtime path is:
 
 ```text
-Apple TV -> Home Assistant custom integration -> local HTTP -> ESP32
+Apple TV -> pymobiledevice3 DVT collector -> loopback MQTT -> Home Assistant
+Apple TV -> official Home Assistant media player -----------^
+Home Assistant custom integration -> authenticated local HTTP -> ESP32
 ESP32 -> Bluetooth Classic SPP -> Denon receiver
 ```
 
-The ESP32 owns the volume table and the restore loop. Home Assistant sends the
-Apple TV `app_id` and display name when they are available, and keeps a local
-backup of the table. There is no cloud service or external database.
+The ESP32 owns the volume table, safety state, and restore loop. Home Assistant
+sends the selected app plus a tri-state playback authorization and keeps a local
+backup of the table. The collector's DVT snapshot is the foreground authority;
+its syslog stream is telemetry only. There is no cloud service or external
+database.
 
 ## Requirements
 
@@ -24,6 +28,8 @@ backup of the table. There is no cloud service or external database.
 - A supported Denon receiver and its remote control.
 - A 2.4 GHz Wi-Fi network shared with Home Assistant.
 - Home Assistant with the official Apple TV integration already working.
+- For idle foreground-app switching, an always-on Linux host paired with the
+  Apple TV through `pymobiledevice3`, plus a loopback-only Mosquitto broker.
 - PlatformIO for building and flashing the firmware.
 - HACS, or file access to the Home Assistant configuration directory, for the
   custom integration.
@@ -133,11 +139,46 @@ cp -R custom_components/denon_app_volume \
 
 Restart Home Assistant after copying the directory.
 
-### 4. Add the discovered device
+### 4. Run the foreground collector
+
+This step is required for switching volumes when an app is open but not
+playing. A playback-only installation may instead select the official Apple TV
+media player in step 5.
+
+The files in `tools/appletv_foreground/` are the deployed collector, pinned
+dependencies, environment template, and systemd units. The supplied units
+expect the collector and virtual environment in `/opt/appletv-foreground`, the
+private environment file at `/etc/appletv-foreground.env`, and an existing
+persistent `pymobiledevice3` pairing for the Apple TV. Configure Mosquitto to
+listen only on loopback, give the collector a dedicated account restricted to
+its topic prefix, and never commit the populated environment file.
+
+Keep the service directory, virtual environment, script, and their parent paths
+root-owned and not writable by the unprivileged service account. The tunnel
+service runs as root because `pymobiledevice3` requires it; the collector itself
+runs unprivileged. After installing the files, enable `appletv-tunneld.service`
+and `appletv-foreground.service`. A healthy collector publishes retained MQTT
+discovery, foreground state, and availability at QoS 1.
+
+With the default DVT polling enabled, DVT is the sole state authority. Syslog
+can add diagnostic lifecycle records but cannot keep the sensor online or
+change its state. A failed or ambiguous DVT snapshot makes the MQTT sensor
+unavailable and preserves the last retained identity rather than publishing a
+false clear.
+
+### 5. Add the discovered device
 
 1. Open **Settings > Devices & services** in Home Assistant.
 2. Find the discovered **Denon App Volume** device and select **Configure**.
-3. Choose the Apple TV media player to follow and confirm.
+3. Choose the MQTT **Apple TV Foreground App** sensor to support idle app
+   switching, or choose the official Apple TV media player for playback-only
+   behavior, and confirm.
+
+When the MQTT sensor is selected, the current integration requires exactly one
+enabled official Apple TV media-player entity. It uses that entity only for
+playback ownership and safety. If Home Assistant has zero or multiple enabled
+Apple TV media players, foreground updates fail closed until the ambiguity is
+removed.
 
 Confirmation claims a device-generated API token. An unpaired ESP32 accepts
 this claim from its setup network or for ten minutes after joining or restarting
@@ -152,20 +193,72 @@ Manual host entry also helps when mDNS is blocked across VLANs.
 
 ## Normal operation
 
-Home Assistant sends a known Apple TV playback-app identity on state changes and
-as a five-second heartbeat. The ESP32 waits briefly for the identity to settle,
-then:
+The foreground collector publishes the app visibly on screen. Home Assistant
+combines it with the official Apple TV media player before sending an update to
+the ESP32:
+
+- active playback with a valid app identity owns the receiver, even while a
+  different app is in front;
+- a fresh foreground event may restore a volume only while playback is
+  authoritatively idle or paused;
+- off, unavailable, unknown, contradictory, or missing playback authority
+  revokes the temporary restore permission and sends no new foreground target.
+
+Each collector transition carries a stable 32-character lowercase hexadecimal
+`event_id`. Home Assistant keeps the latest transition pending across a failed
+ESP32 request and retries it after the normal five-second wait; a newer event
+supersedes the pending one. Repeating the same event is idempotent in firmware,
+so a transport retry cannot renew its short idle authorization or start a
+second target. Off or unavailable playback fails closed without consuming the
+pending foreground event. The ESP32 keeps the last granted ID in RAM, not NVS;
+after a restart, a retained state or heartbeat is not treated as a fresh
+foreground transition.
+
+A fresh idle event is accepted only after the receiver link, session, volume,
+and mute state are authoritative and no manual target or re-mute recovery is in
+progress. Until then, the ESP32 returns `503` without consuming the `event_id`,
+so Home Assistant can deliver that same transition after readiness.
+
+This means Spotify can keep playing at its own volume while the user browses
+another app. The browsed app is applied only after it becomes eligible. After a
+1.5-second identity debounce, the ESP32:
 
 - saves the current Denon volume for the outgoing app;
-- restores the incoming app's saved volume one Denon step at a time, waiting
-  for receiver feedback between steps;
+- restores the incoming app's saved volume with feedback-bounded accelerated
+  steps and a fine exact finish;
 - ignores intermediate restore values so they do not overwrite the saved value;
 - records later manual changes as the active app's new volume.
 
+An unseen well-formed app is learned at the current receiver volume only when
+the receiver is unmuted. Sentinel identities such as `unknown`, `unavailable`,
+`none`, and `null` never create rows or targets.
+
+If the user has muted the Denon and playback is freshly and authoritatively
+idle, automation may perform one bounded known-app restore. Denon volume frames
+inherently unmute the receiver, so the ESP32 first persists a re-mute recovery
+marker, restores the exact target, sends mute-on, waits for authoritative mute
+confirmation, and only then clears the marker. If another app owns active audio,
+or playback authority is stale or unknown, automation neither changes volume
+nor unmutes. A physical Denon volume change or manual unmute remains user intent
+and resumes normal learning.
+
+If Bluetooth, the ESP32, or the receiver is interrupted after that bounded
+transaction has temporarily unmuted the Denon, the accepted limitation is that
+the receiver may remain unmuted until the control link returns. The persisted
+marker makes mute-on the first state-changing recovery command before any later
+volume command. Physical acceptance of this interrupted-recovery path remains
+deferred; see `ACCEPTANCE.md`.
+
 A restore stops instead of issuing blind commands if receiver feedback stalls,
-does not move toward the target, exceeds 196 steps, or runs for 30 seconds.
+does not move toward the target, exceeds 196 steps, runs for 30 seconds, or
+violates an acceleration-liability bound. If the five-second idle authorization
+expires during a muted transaction, an unfinished target stops and re-mutes;
+an already exact target completes and re-mutes without leaving a stale error.
 `GET /api/state` and `GET /api/apps` expose `restore_state` (`idle`,
-`restoring`, or `error`) and a stable `restore_error` value when it stops.
+`restoring`, `remuting`, or `error`) and a stable `restore_error` value when it
+stops. They also expose authoritative `mute_known`, `muted`, and
+`manual_mute_lock` fields. `GET /api/state` includes `volume_target_id`, which
+lets a client detect that another request replaced or cancelled its target.
 
 The ESP32 keeps up to 16 app entries in NVS, which survives power loss and
 restart. When full, it reuses the oldest entry. Writes are delayed briefly to
@@ -180,23 +273,22 @@ disk; changed snapshots are saved after a short delay.
 Open `http://denon-volume-<DEVICE_ID_PREFIX>.local/` to see the live connection
 state, current receiver volume, pairing controls, and the per-app volume table.
 
-### Apple TV app identity limitation
+### Apple TV app identity and ownership limitations
 
-This uses the official [Home Assistant Apple TV
-integration](https://www.home-assistant.io/integrations/apple_tv/) and its
-`app_id`/`app_name` attributes. An identity supplied while media is playing or
-paused is exact. When a responsive Apple TV state loses `app_id`, Home Assistant
-sends an explicit clear. The ESP32 stops attributing later volume changes to the
-previous app but retains its saved row. A truly `unknown` or `unavailable`
-entity sends nothing; the last known ownership is preserved until the entity
-returns.
+The official [Home Assistant Apple TV
+integration](https://www.home-assistant.io/integrations/apple_tv/) supplies the
+playback owner; it does not identify an idle foreground app. The local
+`pymobiledevice3` DVT collector supplies that separate foreground identity.
+Home Assistant gives active playback precedence and sends `playback_active`
+only when the value is authoritative: `true` for active ownership, `false` with
+a new valid `event_id` for one fresh idle foreground handoff, and no field to
+revoke that temporary permission without clearing the remembered owner.
 
-The stock integration cannot identify an idle foreground app. Its underlying
-[pyatv app API](https://github.com/postlund/pyatv/blob/master/pyatv/interface.py#L3451-L3467)
-explicitly reports the app playing media, not the app merely active on screen.
-Consequently, opening YouTube or Netflix without playback does not trigger a
-volume switch. Tracking an app merely because Home Assistant launched it is not
-implemented.
+The collector deliberately fails closed. A confirmed screen-saver/foreground
+clear is a nonempty retained JSON event; an EOF, service stop, DVT failure, or
+ambiguous snapshot changes availability to offline without publishing an empty
+retained tombstone. Full deliberate-failure, reconnect, and lossy-lifecycle
+physical acceptance is still deferred.
 
 ## Local API
 
@@ -205,8 +297,10 @@ Discovery and status:
 - `GET /api/info` returns the product, API version, generated device ID, name,
   hostname, and pairing state.
 - `GET /api/state` returns Wi-Fi, receiver, Bluetooth, volume, active app,
-  restore state, and `network_mode` (`dhcp` or `static`).
-- `GET /api/apps` returns the bounded per-app volume table.
+  restore state, mute state and lock, target generation, and `network_mode`
+  (`dhcp` or `static`).
+- `GET /api/apps` returns the bounded per-app volume table plus current app,
+  restore state, mute state, and lock.
 - `GET /api/backup` returns a versioned app-volume snapshot and `ETag`. It
   requires `Authorization: Bearer <DEVICE_TOKEN>` and sends `Cache-Control:
   no-store`.
@@ -219,13 +313,20 @@ Pairing and app updates:
   `{"token":"<64_LOWERCASE_HEX_CHARACTERS>"}`.
   Later claims return a conflict; claims outside the window are forbidden.
 - `POST /api/app` accepts
-  `{"app_id":"<APP_ID>","app_name":"<APP_NAME>"}` and requires
-  `Authorization: Bearer <DEVICE_TOKEN>`. A string `app_id` of `""` is the valid
-  no-playing-app state: it cancels pending work, clears current app ownership,
-  leaves stored rows untouched, and returns
+  `{"app_id":"<APP_ID>","app_name":"<APP_NAME>","playback_active":<BOOLEAN>,"event_id":"<32_LOWERCASE_HEX>"}`
+  and requires
+  `Authorization: Bearer <DEVICE_TOKEN>`. A string `app_id` of `""` represents
+  an explicit observed foreground clear: it cancels pending work, clears current
+  app ownership, leaves stored rows untouched, and returns
   `202 {"accepted":true,"cleared":true}`. A non-empty accepted ID returns
   `202`, an ignored transient identity returns `204`, malformed JSON or
   non-string fields return `400`, and a missing or invalid token returns `401`.
+  `playback_active=true` marks active playback ownership. A
+  `playback_active=false` request with a new valid `event_id` grants one fresh
+  muted-idle restore lease; a retry with the same ID is idempotent. Omitting the
+  field revokes a prior lease without granting automation permission. A valid
+  fresh idle event returns `503` without consuming its ID while receiver state
+  is not ready; Home Assistant may retry the same request after readiness.
 - `PUT /api/backup` restores a validated versioned snapshot only when the
   device table is empty. It requires the bearer token and the `ETag` from a
   preceding `GET /api/backup` in `If-Match`, rejects concurrent changes, and
@@ -236,6 +337,9 @@ Pairing and app updates:
 Receiver and provisioning controls:
 
 - `POST /api/volume/up` and `POST /api/volume/down` change one Denon step.
+- `POST /api/volume` with form field `volume` requests an exact 0.5-step display
+  value. Manual volume endpoints return `423` while mute is unknown, on, locked,
+  or awaiting recovery, and `409` while another target is active.
 - `POST /api/denon` with form field `mac` saves the selected receiver.
 - `POST /api/denon/reconnect` retries the saved receiver.
 - `DELETE /api/denon` removes only the saved receiver bond and restarts the
@@ -274,6 +378,34 @@ trusted LAN. Do not forward its HTTP port or expose it through a public reverse
 proxy. The first client to call the pairing endpoint during an open claim
 window receives the token.
 
+## Production-ready v1 and deferred acceptance
+
+The user accepted the physically verified foreground restore, playback
+ownership, exact accelerated targeting, manual learning, bounded idle-muted
+restore, and re-mute behavior as the production-ready v1 milestone. The final
+readiness/retry build is physically accepted: a pre-ready request returned `503`
+without consuming its event, the retry applied exactly once after readiness,
+and the receiver restored exact app targets, re-muted, stayed idle and
+error-free, and preserved every stored row without duplicate targets.
+
+Production-ready v1 is green. The whole project is not complete; the remaining
+deferred physical work is:
+
+- playback beginning midway through a muted idle restore;
+- controlled sentinel, stale, off, unavailable, explicit-clear, and EOF cases;
+- physical volume intervention during an automatic restore;
+- active-target receiver or Bluetooth interruption and reconnect;
+- interrupted re-mute recovery across ESP32, Bluetooth, or receiver loss;
+- a full ESP32 power-cycle followed by reopening each saved app;
+- a complete foreground browse sequence during uninterrupted background audio;
+- deliberate DVT failure, ambiguity, syslog EOF, restart, sleep, wake, and
+  lossy-lifecycle robustness with correlated MQTT, Home Assistant, ESP32, and
+  receiver evidence.
+
+Treat these as deferred acceptance, not completed behavior. The exact evidence
+contract, timing bounds, historical failures, superseded requirements, and
+authoritative pass/fail rows are in `ACCEPTANCE.md`.
+
 ## Reset and re-pair
 
 - For a normal Home Assistant removal, call authenticated `POST /api/unpair`
@@ -297,6 +429,9 @@ Firmware build and protocol checks:
 ```sh
 PLATFORMIO_CORE_DIR="$PWD/.pio-home" .venv/bin/pio run
 .venv/bin/python test/protocol_check.py
+c++ -std=c++17 -Wall -Wextra -Werror -pedantic \
+  test/volume_target_check.cpp -o /tmp/volume-target-check
+/tmp/volume-target-check
 ```
 
 Repository privacy checks:
@@ -312,6 +447,12 @@ Home Assistant integration tests:
 ```sh
 .venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m pytest -q tests
+```
+
+Foreground collector tests:
+
+```sh
+.venv/bin/python -m unittest tools.appletv_foreground.test_parser
 ```
 
 Live state checks require an explicit local URL and do not contain a default

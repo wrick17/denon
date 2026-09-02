@@ -120,12 +120,23 @@ async def async_send_app(
     token: str,
     app_id: str,
     app_name: str,
+    *,
+    playback_active: bool | None = None,
+    event_id: str | None = None,
 ) -> None:
     """Send the current Apple TV app to the paired ESP32."""
+    payload: dict[str, str | bool] = {
+        "app_id": app_id,
+        "app_name": app_name,
+    }
+    if playback_active is not None:
+        payload["playback_active"] = playback_active
+    if event_id is not None:
+        payload["event_id"] = event_id
     async with session.post(
         device_url(host, port, "/api/app"),
         headers={"Authorization": f"Bearer {token}"},
-        json={"app_id": app_id, "app_name": app_name},
+        json=payload,
         timeout=_TIMEOUT,
     ) as response:
         response.raise_for_status()

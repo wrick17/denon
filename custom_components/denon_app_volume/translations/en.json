@@ -4,17 +4,24 @@
     "step": {
       "user": {
         "title": "Connect to Denon App Volume",
-        "description": "Enter the ESP32 host and choose the Apple TV to follow. If the ESP32 joined Wi-Fi more than ten minutes ago, restart it and submit within ten minutes.",
+        "description": "Enter the ESP32 host and choose the official Apple TV media player or MQTT sensor that provides app_id and app_name. If the ESP32 joined Wi-Fi more than ten minutes ago, restart it and submit within ten minutes.",
         "data": {
           "host": "ESP32 host",
-          "entity_id": "Apple TV media player"
+          "entity_id": "App identity source"
         }
       },
       "zeroconf_confirm": {
         "title": "Set up {name}",
-        "description": "Choose the Apple TV to follow. If the ESP32 joined Wi-Fi more than ten minutes ago, restart it and submit within ten minutes.",
+        "description": "Choose the official Apple TV media player or MQTT sensor that provides app_id and app_name. If the ESP32 joined Wi-Fi more than ten minutes ago, restart it and submit within ten minutes.",
         "data": {
-          "entity_id": "Apple TV media player"
+          "entity_id": "App identity source"
+        }
+      },
+      "reconfigure": {
+        "title": "Change app identity source",
+        "description": "Choose the official Apple TV media player or MQTT sensor that provides app_id and app_name.",
+        "data": {
+          "entity_id": "App identity source"
         }
       },
       "reauth_confirm": {
@@ -31,6 +38,7 @@
     "abort": {
       "already_configured": "This ESP32 is already configured.",
       "cannot_connect": "Could not connect to the discovered ESP32.",
+      "reconfigure_successful": "The app identity source was updated.",
       "reauth_successful": "ESP32 authentication was repaired."
     }
   }

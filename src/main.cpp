@@ -10,6 +10,7 @@
 #include <esp_system.h>
 
 #include "config.h"
+#include "volume_target.h"
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error "Bluetooth Classic requires the original ESP32 and Bluedroid."
@@ -31,13 +32,15 @@ constexpr unsigned long kStatusIntervalMs = 5000;
 constexpr unsigned long kBondRemovalTimeoutMs = 3000;
 constexpr unsigned long kAppStableMs = 1500;
 constexpr unsigned long kAppPersistDelayMs = 2000;
-constexpr unsigned long kRestoreFeedbackTimeoutMs = 600;
+constexpr unsigned long kPlaybackIdleFreshMs = 5000;
+constexpr unsigned long kVolumeMovementStatusDelayMs = 450;
+constexpr unsigned long kVolumeStepResponseTimeoutMs = 1800;
+constexpr unsigned long kVolumeStatusResponseTimeoutMs = 1200;
 constexpr unsigned long kRestoreDeadlineMs = 30000;
 constexpr unsigned long kRestoreFailureCooldownMs = 2000;
 constexpr unsigned long kApiClaimWindowMs = 10UL * 60UL * 1000UL;
 constexpr unsigned long kTokenResetHoldMs = 10UL * 1000UL;
 constexpr uint8_t kBootButtonPin = 0;
-constexpr uint8_t kMaxVolumeRaw = 196;
 constexpr uint16_t kRestoreMaxSteps = kMaxVolumeRaw;
 constexpr size_t kMaxApps = 16;
 constexpr size_t kMaxAppIdLength = 96;
@@ -47,6 +50,7 @@ constexpr uint32_t kStoredAppMagic = 0x44564131;  // DVA1
 
 constexpr uint8_t kVolumeUp[] = {0x41, 0x54, 0x07, 0x00, 0x00, 0x00};
 constexpr uint8_t kVolumeDown[] = {0x41, 0x54, 0x07, 0x01, 0x00, 0x00};
+constexpr uint8_t kMuteOn[] = {0x41, 0x54, 0x07, 0x1D, 0x01, 0x01, 0xFE};
 constexpr uint8_t kControlHandshake[] = {0x41, 0x54, 0x07, 0x25,
                                          0x01, 0x20, 0xDF};
 constexpr uint8_t kGetSources[] = {0x41, 0x54, 0x00, 0x04, 0x00, 0x00};
@@ -103,6 +107,19 @@ struct StoredAppVolume {
   char appName[kMaxAppNameLength + 1] = {};
 };
 
+enum class VolumeTargetPhase : uint8_t {
+  idle,
+  needFreshStatus,
+  waitFreshStatus,
+  waitAutomaticUnmute,
+  ready,
+  waitBurstSecond,
+  waitMovement,
+  waitMovementStatus,
+  settling,
+  waitConfirmation,
+};
+
 StoredAppVolume appVolumes[kMaxApps];
 bool appDirty[kMaxApps] = {};
 unsigned long appPersistAt[kMaxApps] = {};
@@ -117,6 +134,12 @@ String currentAppName;
 String pendingAppId;
 String pendingAppName;
 unsigned long pendingAppAt = 0;
+bool pendingPlaybackIdleAuthorized = false;
+unsigned long pendingPlaybackAt = 0;
+bool pendingRestoreAllowed = true;
+bool currentPlaybackIdleAuthorized = false;
+unsigned long currentPlaybackAt = 0;
+char lastPlaybackIdleEventId[33] = {};
 unsigned long apiClaimUntil = 0;
 bool wifiWasConnected = false;
 bool staticNetworkEnabled = false;
@@ -125,17 +148,47 @@ IPAddress staticGateway;
 IPAddress staticSubnet;
 IPAddress staticDns;
 int restoreTargetRaw = -1;
-bool restoreAwaitingFeedback = false;
-bool restoreStatusRequested = false;
+bool restoreSessionArmed = false;
+bool restoreAutomatic = false;
+bool restoreManualMuteOverride = false;
 bool restoreLearningSuppressed = false;
 uint16_t restoreSteps = 0;
+VolumeTargetPhase restorePhase = VolumeTargetPhase::idle;
+int restoreObservedRaw = -1;
 int restoreCommandRaw = -1;
-unsigned long restoreSentAt = 0;
-unsigned long nextRestoreAt = 0;
+int restoreCommandDirection = 0;
+bool restoreCorrectiveReversalUsed = false;
+bool restoreCoarseEnabled = true;
+bool restoreBurstActive = false;
+bool restoreBurstExtensionPending = false;
+bool restoreAutomaticMuteCycle = false;
+bool restoreAutomaticUnmuteObserved = false;
+bool automaticRemuteRequired = false;
+bool automaticMuteConfirmationPending = false;
+bool automaticRemuteJournalPersisted = false;
+unsigned long automaticMuteCommandAt = 0;
+unsigned long automaticRemuteNotBefore = 0;
+int automaticRemuteBaselineRaw = -1;
+int restoreBurstStartRaw = -1;
+uint8_t restoreBurstClicksPlanned = 0;
+uint8_t restoreBurstClicksSent = 0;
+int restoreBurstMeasuredDeltaRaw = 0;
+int restoreBurstMeasuredClicks = 0;
+unsigned long restoreCommandAt = 0;
+unsigned long restoreLastChangedAt = 0;
+unsigned long restorePhaseAt = 0;
 unsigned long restoreDeadlineAt = 0;
 String restoreError;
 int restoreFailureRaw = -1;
 unsigned long restoreLearningResumeAt = 0;
+uint32_t volumeTargetGeneration = 0;
+bool muteStateKnown = false;
+bool denonMuted = false;
+bool manualMuteLocked = false;
+int manualMuteLockRaw = -1;
+bool muteAutomaticFeedbackPending = false;
+unsigned long muteAutomaticFeedbackUntil = 0;
+int muteManualFeedbackDirection = 0;
 unsigned long bootButtonPressedAt = 0;
 bool tokenResetArmed = false;
 
@@ -166,9 +219,9 @@ unsigned long nextStatusAt = 0;
 const char kPage[] PROGMEM = R"HTML(
 <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Denon volume</title><style>
-body{font-family:system-ui,sans-serif;max-width:34rem;margin:2rem auto;padding:0 1rem;background:#111;color:#f4f4f4}main{background:#1d1d1d;border-radius:1rem;padding:1.25rem}button,input{box-sizing:border-box;font:inherit;border-radius:.65rem;padding:.8rem;border:0}button{background:#e9b949;color:#111;font-weight:700;min-width:5rem}button:disabled{opacity:.45}.row{display:flex;gap:.75rem;align-items:center;justify-content:center;margin:1rem 0}.volume{font-size:3.5rem;text-align:center}.muted{color:#aaa;font-size:.9rem;text-align:center}.note{color:#bbb;font-size:.9rem;line-height:1.4}form{display:grid;gap:.6rem;margin-top:1rem}input{display:block;width:100%;margin-top:.25rem}#devices button{width:100%;margin-top:.4rem;text-align:left;background:#ddd;overflow-wrap:anywhere;white-space:normal}section{border-top:1px solid #444;margin-top:1.25rem;padding-top:.75rem}.secondary{background:#555;color:#fff;width:100%;margin-top:.6rem}.pairing{text-align:center;border:2px solid #e9b949;border-radius:.75rem;padding:1rem;margin-top:1rem}.pairing-number{font-size:3rem;font-weight:800;letter-spacing:.12em;margin:.4rem 0;color:#e9b949}.pairing-action{font-size:1.15rem;font-weight:700}table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:.55rem .3rem;border-bottom:1px solid #444}th:nth-child(n+2),td:nth-child(n+2){text-align:right}.active{color:#e9b949;font-weight:700}
-</style><main><h1>Denon volume</h1><p id=connection class=muted>Starting…</p><div id=volume class=volume>—</div><p id=db class=muted></p><div class=row><button onclick="send('down')" disabled>−</button><button onclick="send('up')" disabled>+</button></div><section id=receiver><p class=note>On the Denon remote, hold <b>Bluetooth</b> for 3 seconds until Pairing appears, then select the receiver below. When the same six-digit number appears here and on the Denon, confirm it on the receiver. Set Bluetooth Auto-Select to Off if this control connection should not change inputs.</p><button id=scan onclick=scan()>Find receiver</button><div id=devices></div><div id=pairing-confirm class=pairing hidden><p>Confirm this number matches the Denon:</p><div id=pairing-number class=pairing-number></div><p class=pairing-action>Press ENTER on the Denon now</p><p class=note>The ESP32 has already accepted this number. No phone confirmation is needed.</p></div><p id=pairing-message class=note></p><button id=retry class=secondary onclick=retryReceiver() hidden>Retry pairing</button><button id=forget class=secondary onclick=forgetReceiver() hidden>Forget receiver</button></section><section><h2>App volume memory</h2><p id=app-status class=note>Waiting for Home Assistant…</p><table><thead><tr><th>App</th><th>Volume</th><th>dB</th></tr></thead><tbody id=apps></tbody></table></section><section id=wifi><form onsubmit=saveWifi(event)><label>Wi-Fi name<input id=ssid required maxlength=32 autocomplete=off></label><label>Wi-Fi password<input id=password type=password maxlength=63></label><label>Preferred IP address (optional)<input id=preferred-ip inputmode=decimal maxlength=15 placeholder="Leave blank for DHCP" autocomplete=off></label><button>Save Wi-Fi</button></form></section></main><script>
-const q=s=>document.querySelector(s);let provisioning=false;const pairingMessages={waiting:'Waiting for the Denon pairing number…',confirm_on_denon:'Confirm the matching number on the Denon.',timed_out:'Pairing attempt ended. Put the Denon in pairing mode, then tap Retry pairing.'};async function api(url,opt){let r=await fetch(url,opt);if(!r.ok)throw Error(await r.text());return r.status===204?null:r.json()}async function send(dir){try{await api('/api/volume/'+dir,{method:'POST'});setTimeout(state,300)}catch(e){alert(e.message)}}async function state(){if(provisioning)return;try{let s=await api('/api/state');q('#connection').textContent=s.connected?'Receiver connected':s.connecting?'Connecting to receiver…':s.receiver_configured?'Receiver disconnected':'Select a receiver';q('#volume').textContent=s.volume===null?'—':s.volume;q('#db').textContent=s.volume_db===null?'':s.volume_db+' dB';document.querySelectorAll('.row button').forEach(b=>b.disabled=!s.connected);q('#scan').hidden=s.receiver_configured;q('#retry').hidden=!s.receiver_configured||s.connected||s.connecting;q('#retry').textContent=s.receiver_bonded?'Retry connection':'Retry pairing';q('#forget').hidden=!s.receiver_configured;q('#wifi').hidden=!s.setup_ap;let confirming=s.pairing_status==='confirm_on_denon'&&s.pairing_number;q('#pairing-confirm').hidden=!confirming;q('#pairing-number').textContent=confirming?s.pairing_number:'';q('#pairing-message').textContent=pairingMessages[s.pairing_status]||''}catch(e){q('#connection').textContent='ESP32 unavailable'}}async function appTable(){if(provisioning)return;try{let j=await api('/api/apps');q('#apps').replaceChildren(...j.apps.map(x=>{let r=document.createElement('tr'),n=document.createElement('td'),v=document.createElement('td'),d=document.createElement('td');n.textContent=(x.active?'● ':'')+(x.app_name||x.app_id);if(x.active)n.className='active';v.textContent=x.volume;d.textContent=x.volume_db;r.append(n,v,d);return r}));q('#app-status').textContent=j.restoring?'Restoring saved volume…':j.apps.length?'Volumes update after manual changes.':'Waiting for Home Assistant…'}catch(e){q('#app-status').textContent='App memory unavailable'}}async function scan(){let d=q('#devices');d.textContent='Scanning Bluetooth for 8 seconds…';try{let j=await api('/api/discover');d.replaceChildren(...j.devices.map(x=>{let b=document.createElement('button');b.textContent=(x.name||'Bluetooth device')+' '+x.mac;b.onclick=()=>receiver(x.mac);return b}));if(!j.devices.length)d.textContent='No devices found. Check Denon pairing mode and try again.'}catch(e){d.textContent=e.message}}async function receiver(mac){try{await api('/api/denon',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)});q('#devices').textContent='Saved. Connecting…';state()}catch(e){alert(e.message)}}async function retryReceiver(){try{await api('/api/denon/reconnect',{method:'POST'});state()}catch(e){alert(e.message)}}async function forgetReceiver(){if(!confirm('Forget the saved receiver?'))return;await fetch('/api/denon',{method:'DELETE'});q('#connection').textContent='Restarting…'}async function saveWifi(e){e.preventDefault();try{let r=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(q('#ssid').value)+'&password='+encodeURIComponent(q('#password').value)+'&preferred_ip='+encodeURIComponent(q('#preferred-ip').value)});if(!r.ok)throw Error(await r.text());provisioning=true;q('#wifi').hidden=true;q('#connection').textContent='Wi-Fi saved. Rejoin your home Wi-Fi. Home Assistant will discover this ESP32.'}catch(e){alert(e.message)}}state();appTable();setInterval(()=>{state();appTable()},1000);
+body{font-family:system-ui,sans-serif;max-width:34rem;margin:2rem auto;padding:0 1rem;background:#111;color:#f4f4f4}main{background:#1d1d1d;border-radius:1rem;padding:1.25rem}button,input{box-sizing:border-box;font:inherit;border-radius:.65rem;padding:.8rem;border:0}button{background:#e9b949;color:#111;font-weight:700;min-width:5rem}button:disabled{opacity:.45}.row{display:flex;gap:.75rem;align-items:center;justify-content:center;margin:1rem 0}.volume{font-size:3.5rem;text-align:center}.muted{color:#aaa;font-size:.9rem;text-align:center}.mute-status{width:max-content;margin:.25rem auto 0;padding:.35rem .65rem;border-radius:99rem;background:#333;color:#ddd;font-weight:700}.mute-status.is-muted{background:#762727;color:#fff}.mute-status.is-unmuted{background:#194a34;color:#b8f5d4}.note{color:#bbb;font-size:.9rem;line-height:1.4}form{display:grid;gap:.6rem;margin-top:1rem}input{display:block;width:100%;margin-top:.25rem}#target{display:flex;align-items:center}#target label{white-space:nowrap}#target input{min-width:0;margin:0;flex:1}#target button{white-space:nowrap}#devices button{width:100%;margin-top:.4rem;text-align:left;background:#ddd;overflow-wrap:anywhere;white-space:normal}section{border-top:1px solid #444;margin-top:1.25rem;padding-top:.75rem}.secondary{background:#555;color:#fff;width:100%;margin-top:.6rem}.pairing{text-align:center;border:2px solid #e9b949;border-radius:.75rem;padding:1rem;margin-top:1rem}.pairing-number{font-size:3rem;font-weight:800;letter-spacing:.12em;margin:.4rem 0;color:#e9b949}.pairing-action{font-size:1.15rem;font-weight:700}table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:.55rem .3rem;border-bottom:1px solid #444}th:nth-child(n+2),td:nth-child(n+2){text-align:right}.active{color:#e9b949;font-weight:700}@media(max-width:22rem){#target{display:grid;grid-template-columns:1fr auto}#target label{grid-column:1/-1}#target input{width:100%}}
+</style><main><h1>Denon volume</h1><p id=connection class=muted>Starting…</p><div id=volume class=volume>—</div><p id=db class=muted></p><p id=mute-status class=mute-status role=status aria-live=polite>Mute state unknown</p><div class=row><button onclick="send('down')" disabled>−</button><button onclick="send('up')" disabled>+</button></div><form id=target onsubmit=setTargetVolume(event)><label for=target-volume>Target volume</label><input id=target-volume type=number min=0 max=98 step=.5 required inputmode=decimal><button disabled>Set</button></form><p id=target-status class=note></p><section><h2>App volume memory</h2><p id=app-status class=note>Waiting for Home Assistant…</p><table><thead><tr><th>App</th><th>Volume</th><th>dB</th></tr></thead><tbody id=apps></tbody></table></section><section id=receiver><p class=note>On the Denon remote, hold <b>Bluetooth</b> for 3 seconds until Pairing appears, then select the receiver below. When the same six-digit number appears here and on the Denon, confirm it on the receiver. Set Bluetooth Auto-Select to Off if this control connection should not change inputs.</p><button id=scan onclick=scan()>Find receiver</button><div id=devices></div><div id=pairing-confirm class=pairing hidden><p>Confirm this number matches the Denon:</p><div id=pairing-number class=pairing-number></div><p class=pairing-action>Press ENTER on the Denon now</p><p class=note>The ESP32 has already accepted this number. No phone confirmation is needed.</p></div><p id=pairing-message class=note></p><button id=retry class=secondary onclick=retryReceiver() hidden>Retry pairing</button><button id=forget class=secondary onclick=forgetReceiver() hidden>Forget receiver</button></section><section id=wifi><form onsubmit=saveWifi(event)><label>Wi-Fi name<input id=ssid required maxlength=32 autocomplete=off></label><label>Wi-Fi password<input id=password type=password maxlength=63></label><label>Preferred IP address (optional)<input id=preferred-ip inputmode=decimal maxlength=15 placeholder="Leave blank for DHCP" autocomplete=off></label><button>Save Wi-Fi</button></form></section></main><script>
+const q=s=>document.querySelector(s);let provisioning=false,targetRequest=null;const pairingMessages={waiting:'Waiting for the Denon pairing number…',confirm_on_denon:'Confirm the matching number on the Denon.',timed_out:'Pairing attempt ended. Put the Denon in pairing mode, then tap Retry pairing.'};async function api(url,opt){let r=await fetch(url,opt);if(!r.ok)throw Error(await r.text());return r.status===204?null:r.json()}async function send(dir){try{await api('/api/volume/'+dir,{method:'POST'});targetRequest=null;q('#target-status').textContent='';setTimeout(state,300)}catch(e){alert(e.message)}}async function setTargetVolume(e){e.preventDefault();let input=q('#target-volume');if(!input.reportValidity())return;let value=Number(input.value);q('#target-status').textContent='Setting volume to '+value.toFixed(1)+'…';try{let result=await api('/api/volume',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'volume='+encodeURIComponent(input.value)});targetRequest={value:value,id:result.target_id};state()}catch(e){targetRequest=null;q('#target-status').textContent=e.message}}async function state(){if(provisioning)return;try{let s=await api('/api/state');q('#connection').textContent=s.connected?'Receiver connected':s.connecting?'Connecting to receiver…':s.receiver_configured?'Receiver disconnected':'Select a receiver';q('#volume').textContent=s.volume===null?'—':s.volume;q('#db').textContent=s.volume_db===null?'':s.volume_db+' dB';let mute=q('#mute-status'),muteText=!s.mute_known?'Mute state unknown':s.muted?'Denon muted'+(s.manual_mute_lock?', automation locked':''):'Denon unmuted';if(mute.textContent!==muteText)mute.textContent=muteText;mute.classList.toggle('is-muted',s.mute_known&&s.muted);mute.classList.toggle('is-unmuted',s.mute_known&&!s.muted);document.querySelectorAll('.row button,#target input,#target button').forEach(b=>b.disabled=!s.connected||s.restoring);if(targetRequest!==null){if(s.volume_target_id!==targetRequest.id){q('#target-status').textContent='Volume change was interrupted';targetRequest=null}else if(s.restore_state==='error'){q('#target-status').textContent='Could not set volume: '+s.restore_error;targetRequest=null}else if(s.restoring){q('#target-status').textContent='Setting volume to '+targetRequest.value.toFixed(1)+'…'}else if(s.volume===targetRequest.value){q('#target-status').textContent='Volume set to '+targetRequest.value.toFixed(1);targetRequest=null}else{q('#target-status').textContent='Volume change was interrupted';targetRequest=null}}q('#scan').hidden=s.receiver_configured;q('#retry').hidden=!s.receiver_configured||s.connected||s.connecting;q('#retry').textContent=s.receiver_bonded?'Retry connection':'Retry pairing';q('#forget').hidden=!s.receiver_configured;q('#wifi').hidden=!s.setup_ap;let confirming=s.pairing_status==='confirm_on_denon'&&s.pairing_number;q('#pairing-confirm').hidden=!confirming;q('#pairing-number').textContent=confirming?s.pairing_number:'';q('#pairing-message').textContent=pairingMessages[s.pairing_status]||''}catch(e){q('#connection').textContent='ESP32 unavailable';let mute=q('#mute-status');mute.textContent='Mute state unavailable';mute.classList.remove('is-muted','is-unmuted')}}async function appTable(){if(provisioning)return;try{let j=await api('/api/apps');q('#apps').replaceChildren(...j.apps.map(x=>{let r=document.createElement('tr'),n=document.createElement('td'),v=document.createElement('td'),d=document.createElement('td'),name=x.app_name||x.app_id;if(name==='MemoryPoster'||name==='com.apple.IdleScreen.MemoryPoster')name='Screensaver';n.textContent=(x.active?'● ':'')+name;if(x.active)n.className='active';v.textContent=x.volume;d.textContent=x.volume_db;r.append(n,v,d);return r}));q('#app-status').textContent=j.restoring?'Setting volume…':j.apps.length?'Volumes update after manual changes.':'Waiting for Home Assistant…'}catch(e){q('#app-status').textContent='App memory unavailable'}}async function scan(){let d=q('#devices');d.textContent='Scanning Bluetooth for 8 seconds…';try{let j=await api('/api/discover');d.replaceChildren(...j.devices.map(x=>{let b=document.createElement('button');b.textContent=(x.name||'Bluetooth device')+' '+x.mac;b.onclick=()=>receiver(x.mac);return b}));if(!j.devices.length)d.textContent='No devices found. Check Denon pairing mode and try again.'}catch(e){d.textContent=e.message}}async function receiver(mac){try{await api('/api/denon',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)});q('#devices').textContent='Saved. Connecting…';state()}catch(e){alert(e.message)}}async function retryReceiver(){try{await api('/api/denon/reconnect',{method:'POST'});state()}catch(e){alert(e.message)}}async function forgetReceiver(){if(!confirm('Forget the saved receiver?'))return;await fetch('/api/denon',{method:'DELETE'});q('#connection').textContent='Restarting…'}async function saveWifi(e){e.preventDefault();try{let r=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(q('#ssid').value)+'&password='+encodeURIComponent(q('#password').value)+'&preferred_ip='+encodeURIComponent(q('#preferred-ip').value)});if(!r.ok)throw Error(await r.text());provisioning=true;q('#wifi').hidden=true;q('#connection').textContent='Wi-Fi saved. Rejoin your home Wi-Fi. Home Assistant will discover this ESP32.'}catch(e){alert(e.message)}}state();appTable();setInterval(()=>{state();appTable()},1000);
 </script>
 )HTML";
 
@@ -333,6 +386,32 @@ bool currentRequestUsesSetupAp() {
   return isSetupApIngress(
       setupApRunning, localAddress == WiFi.softAPIP(),
       WiFi.status() == WL_CONNECTED && localAddress == WiFi.localIP());
+}
+
+bool isLocalControlHost(String host) {
+  const int port = host.indexOf(':');
+  if (port >= 0) host.remove(port);
+  return host == hostName || host == hostName + ".local" ||
+         (WiFi.status() == WL_CONNECTED &&
+          host == WiFi.localIP().toString());
+}
+
+bool hasSameOriginAuthorization() {
+  const String origin = server.header("Origin");
+  const String host = server.header("Host");
+  return isLocalControlHost(host) &&
+         constantTimeEquals(origin, "http://" + host);
+}
+
+bool requireManualVolumeAuthorization() {
+  if (currentRequestUsesSetupAp() || hasAppAuthorization() ||
+      hasSameOriginAuthorization()) {
+    return true;
+  }
+  server.sendHeader("WWW-Authenticate", "Bearer");
+  server.send(401, "text/plain",
+              "Same-origin request or bearer token required for volume control");
+  return false;
 }
 
 bool apiClaimWindowOpen() {
@@ -758,19 +837,12 @@ bool isIgnoredAppId(String appId) {
          appId.equalsIgnoreCase("none") || appId.equalsIgnoreCase("null");
 }
 
-int restoreDirection(int current, int target) {
-  return current < target ? 1 : (current > target ? -1 : 0);
-}
-
-bool canResumeLearningAfterFailure(bool cooldownElapsed, int failedRaw,
-                                   uint8_t observedRaw) {
-  return cooldownElapsed && failedRaw >= 0 && observedRaw != failedRaw;
-}
-
 bool appStateSelfCheck() {
   return isIgnoredAppId("") && isIgnoredAppId("unknown") &&
-         !isIgnoredAppId("com.example.video") && restoreDirection(10, 12) == 1 &&
-         restoreDirection(12, 10) == -1 && restoreDirection(10, 10) == 0 &&
+         isIgnoredAppId("unavailable") && isIgnoredAppId("none") &&
+         isIgnoredAppId("null") &&
+         !isIgnoredAppId("com.example.video") && volumeDirection(10, 12) == 1 &&
+         volumeDirection(12, 10) == -1 && volumeDirection(10, 10) == 0 &&
          !canResumeLearningAfterFailure(false, 100, 101) &&
          !canResumeLearningAfterFailure(true, 100, 100) &&
          !canResumeLearningAfterFailure(true, -1, 101) &&
@@ -779,25 +851,159 @@ bool appStateSelfCheck() {
 
 void resetVolumeRestore(bool clearError) {
   restoreTargetRaw = -1;
-  restoreAwaitingFeedback = false;
-  restoreStatusRequested = false;
+  restoreSessionArmed = false;
+  restoreAutomatic = false;
+  restoreManualMuteOverride = false;
   restoreSteps = 0;
+  restorePhase = VolumeTargetPhase::idle;
+  restoreObservedRaw = -1;
   restoreCommandRaw = -1;
+  restoreCommandDirection = 0;
+  restoreCorrectiveReversalUsed = false;
+  restoreCoarseEnabled = true;
+  restoreBurstActive = false;
+  restoreBurstExtensionPending = false;
+  restoreBurstStartRaw = -1;
+  restoreBurstClicksPlanned = 0;
+  restoreBurstClicksSent = 0;
+  restoreBurstMeasuredDeltaRaw = 0;
+  restoreBurstMeasuredClicks = 0;
+  restoreAutomaticMuteCycle = false;
+  restoreAutomaticUnmuteObserved = false;
+  if (automaticRemuteRequired) {
+    automaticRemuteBaselineRaw = volumeRaw;
+    automaticRemuteNotBefore = millis() + kVolumeStepResponseTimeoutMs;
+  }
   if (clearError) restoreError = "";
 }
 
+bool currentPlaybackIdleFresh(unsigned long now) {
+  return playbackIdleAuthorizationFresh(currentPlaybackIdleAuthorized,
+                                        currentPlaybackAt, now,
+                                        kPlaybackIdleFreshMs);
+}
+
+bool automaticRestoreCommandAllowed() {
+  return volumeCommandAllowed(muteStateKnown, denonMuted, manualMuteLocked) ||
+         (restoreAutomaticMuteCycle && automaticRemuteRequired &&
+          muteStateKnown && !denonMuted);
+}
+
+bool clearAutomaticRemuteJournal() {
+  if (automaticRemuteJournalPersisted && !preferences.remove("remute")) {
+    return false;
+  }
+  automaticRemuteRequired = false;
+  automaticMuteConfirmationPending = false;
+  automaticRemuteJournalPersisted = false;
+  automaticRemuteNotBefore = 0;
+  automaticRemuteBaselineRaw = -1;
+  return true;
+}
+
+bool armAutomaticRemuteRecovery(unsigned long now) {
+  automaticRemuteRequired = true;
+  automaticMuteConfirmationPending = false;
+  automaticRemuteBaselineRaw = volumeRaw;
+  automaticRemuteNotBefore = now + kVolumeStepResponseTimeoutMs;
+  if (automaticRemuteJournalPersisted) return true;
+  automaticRemuteJournalPersisted = preferences.putBool("remute", true) > 0;
+  return automaticRemuteJournalPersisted;
+}
+
+void advanceVolumeTargetGeneration() {
+  if (++volumeTargetGeneration == 0) ++volumeTargetGeneration;
+}
+
+void armVolumeTargetSession(unsigned long now) {
+  restoreSessionArmed = true;
+  restoreSteps = 0;
+  restorePhase = VolumeTargetPhase::needFreshStatus;
+  restoreObservedRaw = -1;
+  restoreCommandRaw = -1;
+  restoreCommandDirection = 0;
+  restoreCorrectiveReversalUsed = false;
+  restoreCoarseEnabled = true;
+  restoreBurstActive = false;
+  restoreBurstExtensionPending = false;
+  restoreBurstStartRaw = -1;
+  restoreBurstClicksPlanned = 0;
+  restoreBurstClicksSent = 0;
+  restoreBurstMeasuredDeltaRaw = 0;
+  restoreBurstMeasuredClicks = 0;
+  restoreCommandAt = now;
+  restoreLastChangedAt = now;
+  restorePhaseAt = now;
+  restoreDeadlineAt = now + kRestoreDeadlineMs;
+}
+
+void pauseVolumeTargetSession() {
+  if (restoreTargetRaw < 0) return;
+  restoreSessionArmed = false;
+  restoreSteps = 0;
+  restorePhase = VolumeTargetPhase::needFreshStatus;
+  restoreObservedRaw = -1;
+  restoreCommandRaw = -1;
+  restoreCommandDirection = 0;
+  restoreCorrectiveReversalUsed = false;
+  restoreCoarseEnabled = true;
+  restoreBurstActive = false;
+  restoreBurstExtensionPending = false;
+  restoreBurstStartRaw = -1;
+  restoreBurstClicksPlanned = 0;
+  restoreBurstClicksSent = 0;
+  restoreBurstMeasuredDeltaRaw = 0;
+  restoreBurstMeasuredClicks = 0;
+  restoreDeadlineAt = 0;
+}
+
 void cancelVolumeRestore() {
+  if (volumeTargetCancellationAdvancesGeneration(restoreTargetRaw)) {
+    advanceVolumeTargetGeneration();
+  }
   resetVolumeRestore(true);
-  restoreLearningSuppressed = false;
+  restoreLearningSuppressed = automaticRemuteRequired;
   restoreFailureRaw = -1;
   restoreLearningResumeAt = 0;
 }
 
 void completeVolumeRestore() {
   resetVolumeRestore(true);
-  restoreLearningSuppressed = false;
+  restoreLearningSuppressed = automaticRemuteRequired;
   restoreFailureRaw = -1;
   restoreLearningResumeAt = 0;
+}
+
+bool setVolume(int targetRaw, bool automatic) {
+  if (targetRaw < 0 || targetRaw > kMaxVolumeRaw) return false;
+  if (automaticRemuteRequired) return false;
+  if (!automatic &&
+      !volumeCommandAllowed(muteStateKnown, denonMuted, manualMuteLocked)) {
+    return false;
+  }
+  const bool mutedIdleRestore =
+      automatic && muteStateKnown && denonMuted && manualMuteLocked &&
+      currentPlaybackIdleFresh(millis());
+  if (automatic &&
+      (manualMuteLocked || (muteStateKnown && denonMuted)) &&
+      !mutedIdleRestore) {
+    restoreLearningSuppressed = true;
+    restoreFailureRaw = volumeRaw;
+    restoreLearningResumeAt = millis();
+    return false;
+  }
+  advanceVolumeTargetGeneration();
+  restoreTargetRaw = targetRaw;
+  restoreAutomatic = automatic;
+  restoreManualMuteOverride = !automatic && manualMuteLocked;
+  restoreLearningSuppressed = true;
+  restoreError = "";
+  armVolumeTargetSession(millis());
+  if (mutedIdleRestore) {
+    restoreAutomaticMuteCycle = true;
+    restorePhase = VolumeTargetPhase::waitAutomaticUnmute;
+  }
+  return true;
 }
 
 void failVolumeRestore(const char *reason) {
@@ -810,35 +1016,44 @@ void failVolumeRestore(const char *reason) {
 }
 
 void startRestoreForCurrentApp() {
+  if (restoreTargetRaw >= 0 && !restoreAutomatic) return;
   const int index = findApp(currentAppId);
   if (index < 0) {
     cancelVolumeRestore();
     return;
   }
-  restoreTargetRaw = appVolumes[index].raw;
-  restoreAwaitingFeedback = false;
-  restoreStatusRequested = false;
-  restoreLearningSuppressed = true;
-  restoreSteps = 0;
-  restoreCommandRaw = -1;
-  restoreError = "";
-  nextRestoreAt = 0;
-  restoreDeadlineAt = millis() + kRestoreDeadlineMs;
-  if (volumeRaw == restoreTargetRaw) completeVolumeRestore();
+  setVolume(appVolumes[index].raw, true);
 }
 
 void clearCurrentApp() {
   pendingAppId = "";
   pendingAppName = "";
+  pendingPlaybackIdleAuthorized = false;
+  pendingRestoreAllowed = true;
   currentAppId = "";
   currentAppName = "";
-  cancelVolumeRestore();
+  currentPlaybackIdleAuthorized = false;
+  if (appClearCancelsVolumeTarget(restoreTargetRaw, restoreAutomatic)) {
+    cancelVolumeRestore();
+  }
 }
 
-void queueAppCandidate(String appId, String appName) {
+void queueAppCandidate(String appId, String appName, bool playbackKnown,
+                       bool playbackActive, String eventId) {
   appId.trim();
   appName.trim();
   if (isIgnoredAppId(appId)) return;
+  const unsigned long now = millis();
+  const bool validIdleEvent =
+      playbackKnown && !playbackActive &&
+      validPlaybackEventId(eventId.c_str(), eventId.length());
+  const bool idleAuthorized = playbackIdleEventGrants(
+      playbackKnown, playbackActive, eventId.c_str(), eventId.length(),
+      lastPlaybackIdleEventId);
+  const bool duplicateIdleEvent = validIdleEvent && !idleAuthorized;
+  if (idleAuthorized) {
+    copyText(lastPlaybackIdleEventId, sizeof(lastPlaybackIdleEventId), eventId);
+  }
   if (appName.isEmpty()) appName = appId;
   if (appName.length() > kMaxAppNameLength) {
     appName = appName.substring(0, kMaxAppNameLength);
@@ -848,7 +1063,13 @@ void queueAppCandidate(String appId, String appName) {
     const bool hadPendingSwitch = !pendingAppId.isEmpty();
     pendingAppId = "";
     pendingAppName = "";
+    pendingRestoreAllowed = true;
     currentAppName = appName;
+    if (!duplicateIdleEvent) {
+      currentPlaybackIdleAuthorized = idleAuthorized;
+      currentPlaybackAt = now;
+      if (!idleAuthorized && restoreAutomaticMuteCycle) cancelVolumeRestore();
+    }
     const int index = findApp(currentAppId);
     if (index >= 0 && appName != appVolumes[index].appName) {
       appVolumes[index].sequence = ++appSequence;
@@ -856,32 +1077,57 @@ void queueAppCandidate(String appId, String appName) {
                appName);
       markAppDirty(static_cast<size_t>(index), false);
     }
-    if (hadPendingSwitch) startRestoreForCurrentApp();
+    if (!duplicateIdleEvent && (hadPendingSwitch || idleAuthorized)) {
+      startRestoreForCurrentApp();
+    }
     return;
   }
 
   if (appId == pendingAppId) {
     pendingAppName = appName;
+    if (!duplicateIdleEvent) {
+      pendingPlaybackIdleAuthorized = idleAuthorized;
+      pendingPlaybackAt = now;
+    }
     return;
   }
 
-  if (!currentAppId.isEmpty() && restoreTargetRaw < 0 &&
-      !restoreLearningSuppressed && volumeRaw >= 0) {
+  if (!currentAppId.isEmpty() && appVolumeLearningAllowed(
+                                         restoreTargetRaw,
+                                         restoreLearningSuppressed, volumeRaw,
+                                         muteStateKnown, denonMuted,
+                                         manualMuteLocked)) {
     rememberAppVolume(currentAppId, currentAppName,
                       static_cast<uint8_t>(volumeRaw), true);
   }
-  cancelVolumeRestore();
+  if (restoreTargetRaw < 0 || restoreAutomatic) cancelVolumeRestore();
   pendingAppId = appId;
   pendingAppName = appName;
-  pendingAppAt = millis();
+  pendingPlaybackIdleAuthorized = idleAuthorized;
+  pendingPlaybackAt = now;
+  pendingRestoreAllowed = !duplicateIdleEvent;
+  pendingAppAt = now;
 }
 
 void activatePendingApp() {
   if (pendingAppId.isEmpty()) return;
+  if (!currentAppId.isEmpty() && appVolumeLearningAllowed(
+                                         restoreTargetRaw,
+                                         restoreLearningSuppressed, volumeRaw,
+                                         muteStateKnown, denonMuted,
+                                         manualMuteLocked)) {
+    rememberAppVolume(currentAppId, currentAppName,
+                      static_cast<uint8_t>(volumeRaw), true);
+  }
   currentAppId = pendingAppId;
   currentAppName = pendingAppName;
+  currentPlaybackIdleAuthorized = pendingPlaybackIdleAuthorized;
+  currentPlaybackAt = pendingPlaybackAt;
   pendingAppId = "";
   pendingAppName = "";
+  pendingPlaybackIdleAuthorized = false;
+  const bool restoreAllowed = pendingRestoreAllowed;
+  pendingRestoreAllowed = true;
 
   const int existing = findApp(currentAppId);
   if (existing >= 0) {
@@ -891,8 +1137,10 @@ void activatePendingApp() {
                sizeof(appVolumes[existing].appName), currentAppName);
       markAppDirty(static_cast<size_t>(existing), false);
     }
-    startRestoreForCurrentApp();
-  } else if (volumeRaw >= 0) {
+    if (restoreAllowed) startRestoreForCurrentApp();
+  } else if (appVolumeLearningAllowed(
+                 restoreTargetRaw, restoreLearningSuppressed, volumeRaw,
+                 muteStateKnown, denonMuted, manualMuteLocked)) {
     rememberAppVolume(currentAppId, currentAppName,
                       static_cast<uint8_t>(volumeRaw), false);
     cancelVolumeRestore();
@@ -900,31 +1148,254 @@ void activatePendingApp() {
 }
 
 void maintainAppSwitch() {
+  if (restoreTargetRaw >= 0 && !restoreAutomatic) return;
   if (!pendingAppId.isEmpty() &&
       millis() - pendingAppAt >= kAppStableMs) {
     activatePendingApp();
   }
 }
 
+void clearManualMuteLock() {
+  manualMuteLocked = false;
+  manualMuteLockRaw = -1;
+  muteAutomaticFeedbackPending = false;
+  muteAutomaticFeedbackUntil = 0;
+  muteManualFeedbackDirection = 0;
+}
+
+void observeMute(bool muted) {
+  const bool activeTargetCommand =
+      volumeTargetMayHavePendingCommand(restoreTargetRaw, restoreSteps);
+  const bool remuteJournalReady =
+      !muted || !activeTargetCommand || automaticRemuteRequired ||
+      armAutomaticRemuteRecovery(millis());
+  const bool becameMuted = !muteStateKnown || !denonMuted;
+  muteStateKnown = true;
+  denonMuted = muted;
+  if (!muted) {
+    if (automaticRemuteRequired) {
+      if (restoreAutomaticMuteCycle) restoreAutomaticUnmuteObserved = true;
+      return;
+    }
+    clearManualMuteLock();
+    return;
+  }
+  if (automaticRemuteConfirmed(automaticRemuteRequired,
+                               automaticMuteConfirmationPending,
+                               muteStateKnown, denonMuted) &&
+      clearAutomaticRemuteJournal()) {
+    restoreLearningSuppressed = false;
+  }
+  if (restoreAutomaticMuteCycle && automaticRemuteRequired &&
+      !restoreAutomaticUnmuteObserved) {
+    return;
+  }
+  if (!becameMuted) return;
+
+  const bool cancelTarget =
+      restoreTargetRaw >= 0 &&
+      (restoreAutomatic || !restoreManualMuteOverride);
+  muteAutomaticFeedbackPending =
+      restoreAutomatic && restoreTargetRaw >= 0 && restoreSteps > 0;
+  muteAutomaticFeedbackUntil = muteAutomaticFeedbackPending
+                                   ? millis() + kVolumeStepResponseTimeoutMs
+                                   : 0;
+  manualMuteLocked = true;
+  manualMuteLockRaw = volumeRaw;
+  if (cancelTarget) {
+    cancelVolumeRestore();
+    restoreLearningSuppressed = true;
+    restoreFailureRaw = volumeRaw;
+    restoreLearningResumeAt = millis();
+    if (!remuteJournalReady) restoreError = "remute_journal_failed";
+  }
+}
+
+void maintainManualMuteLock() {
+  if (!muteAutomaticFeedbackPending ||
+      !timeReached(millis(), muteAutomaticFeedbackUntil)) {
+    return;
+  }
+  muteAutomaticFeedbackPending = false;
+  muteAutomaticFeedbackUntil = 0;
+  manualMuteLockRaw = volumeRaw;
+}
+
+void acceptManualVolumeFeedback(int direction) {
+  if (!manualMuteLocked) return;
+  muteAutomaticFeedbackPending = false;
+  muteAutomaticFeedbackUntil = 0;
+  manualMuteLockRaw = volumeRaw;
+  muteManualFeedbackDirection = direction;
+}
+
+bool validateActiveBurstFeedback(uint8_t raw) {
+  if (!restoreBurstActive || restoreObservedRaw < 0 ||
+      raw == restoreObservedRaw) {
+    return true;
+  }
+  if (volumeRapidFeedbackValid(restoreBurstStartRaw, restoreObservedRaw, raw,
+                               restoreCommandDirection,
+                               restoreBurstClicksSent)) {
+    return true;
+  }
+  const char *reason =
+      volumeMovementInDirection(restoreObservedRaw, raw,
+                                restoreCommandDirection)
+          ? "rapid_gain_exceeded"
+          : "wrong_direction";
+  failVolumeRestore(reason);
+  return false;
+}
+
 void observeVolume(uint8_t raw) {
+  if (automaticRemuteFeedbackChanged(
+          automaticRemuteRequired, restoreAutomaticMuteCycle,
+          automaticRemuteBaselineRaw, raw)) {
+    automaticRemuteBaselineRaw = raw;
+    automaticMuteConfirmationPending = false;
+    automaticRemuteNotBefore = millis() + kVolumeStepResponseTimeoutMs;
+  }
+  if (!restoreAutomaticMuteCycle && !automaticRemuteRequired &&
+      manualMuteLocked && muteManualFeedbackDirection != 0 &&
+      manualMuteLockRaw != raw) {
+    if (manualVolumeFeedbackMatches(manualMuteLockRaw, raw,
+                                    muteManualFeedbackDirection)) {
+      clearManualMuteLock();
+    } else {
+      manualMuteLockRaw = raw;
+    }
+  } else if (!restoreAutomaticMuteCycle && !automaticRemuteRequired &&
+             manualMuteLockClearsOnVolume(
+          manualMuteLocked, manualMuteLockRaw, raw,
+          muteAutomaticFeedbackPending)) {
+    clearManualMuteLock();
+  } else if (!restoreAutomaticMuteCycle && !automaticRemuteRequired &&
+             manualMuteLocked && manualMuteLockRaw != raw) {
+    manualMuteLockRaw = raw;
+  }
   if (restoreTargetRaw >= 0) {
-    if (!restoreAwaitingFeedback) return;
-    const int previousDistance = abs(restoreTargetRaw - restoreCommandRaw);
-    const int newDistance = abs(restoreTargetRaw - static_cast<int>(raw));
-    restoreAwaitingFeedback = false;
-    restoreStatusRequested = false;
-    if (raw == restoreTargetRaw) {
-      completeVolumeRestore();
+    const unsigned long now = millis();
+    const int previousRaw = restoreObservedRaw;
+    if (!validateActiveBurstFeedback(raw)) return;
+    if (restorePhase == VolumeTargetPhase::waitFreshStatus) {
+      restoreObservedRaw = raw;
+      restoreLastChangedAt = now;
+      if (raw == restoreTargetRaw) {
+        completeVolumeRestore();
+      } else {
+        restorePhase = VolumeTargetPhase::ready;
+      }
       return;
     }
-    if (newDistance >= previousDistance) {
-      failVolumeRestore("no_progress");
+    if (restorePhase == VolumeTargetPhase::waitMovement ||
+        restorePhase == VolumeTargetPhase::waitMovementStatus) {
+      const int feedbackBaseline =
+          restoreBurstActive ? restoreObservedRaw : restoreCommandRaw;
+      if (raw == feedbackBaseline) return;
+      if (!restoreBurstActive &&
+          !volumeMovementInDirection(feedbackBaseline, raw,
+                                     restoreCommandDirection)) {
+        failVolumeRestore("wrong_direction");
+        return;
+      }
+      if (restoreBurstActive) {
+        restoreBurstMeasuredDeltaRaw = abs(raw - restoreBurstStartRaw);
+        restoreBurstMeasuredClicks = restoreBurstClicksSent;
+      }
+      restoreObservedRaw = raw;
+      restoreLastChangedAt = now;
+      if (restoreBurstActive) {
+        restoreBurstActive = false;
+        restoreBurstExtensionPending = volumeRapidExtensionAllowed(
+            raw, restoreTargetRaw, restoreCommandDirection,
+            automaticRestoreCommandAllowed(),
+            timeReached(now, restoreDeadlineAt), restoreSteps,
+            kRestoreMaxSteps);
+        restorePhase = restoreBurstExtensionPending
+                           ? VolumeTargetPhase::waitBurstSecond
+                           : VolumeTargetPhase::settling;
+      } else {
+        restorePhase = VolumeTargetPhase::settling;
+      }
       return;
     }
-    nextRestoreAt = millis() + 40;
+    if (restorePhase == VolumeTargetPhase::waitBurstSecond) {
+      if (raw == restoreObservedRaw) return;
+      const bool continuedInDirection = volumeMovementInDirection(
+          restoreObservedRaw, raw, restoreCommandDirection);
+      restoreObservedRaw = raw;
+      restoreLastChangedAt = now;
+      if (restoreBurstExtensionPending) {
+        if (!continuedInDirection ||
+            !volumeRapidExtensionAllowed(
+                raw, restoreTargetRaw, restoreCommandDirection,
+                automaticRestoreCommandAllowed(),
+                timeReached(now, restoreDeadlineAt), restoreSteps,
+                kRestoreMaxSteps)) {
+          restoreBurstExtensionPending = false;
+          restorePhase = VolumeTargetPhase::settling;
+        }
+        return;
+      }
+      const int remainingDirection = volumeDirection(raw, restoreTargetRaw);
+      if (remainingDirection == 0 ||
+          remainingDirection != restoreCommandDirection) {
+        restoreCoarseEnabled = false;
+        restoreBurstClicksPlanned = restoreBurstClicksSent;
+        restorePhase = VolumeTargetPhase::settling;
+      }
+      return;
+    }
+    if (restorePhase == VolumeTargetPhase::settling) {
+      if (previousRaw != raw) {
+        restoreObservedRaw = raw;
+        restoreLastChangedAt = now;
+      }
+      return;
+    }
+    if (restorePhase == VolumeTargetPhase::waitConfirmation) {
+      if (previousRaw != raw) {
+        restoreObservedRaw = raw;
+        restoreLastChangedAt = now;
+        restorePhase = VolumeTargetPhase::settling;
+        return;
+      }
+      if (restoreBurstActive) {
+        const int movedRaw = abs(raw - restoreBurstStartRaw);
+        if (!volumeRapidGainWithinBound(movedRaw,
+                                        restoreBurstClicksSent)) {
+          failVolumeRestore("rapid_gain_exceeded");
+          return;
+        }
+        restoreBurstMeasuredDeltaRaw = movedRaw;
+        restoreBurstMeasuredClicks = restoreBurstClicksSent;
+        const int remainingDirection = volumeDirection(raw, restoreTargetRaw);
+        if (remainingDirection != 0 &&
+            remainingDirection != restoreCommandDirection) {
+          restoreCoarseEnabled = false;
+        }
+        restoreBurstActive = false;
+      }
+      if (raw == restoreTargetRaw) {
+        completeVolumeRestore();
+      } else {
+        restorePhase = VolumeTargetPhase::ready;
+      }
+      return;
+    }
+    if (restorePhase == VolumeTargetPhase::ready && previousRaw != raw) {
+      restoreObservedRaw = raw;
+      restoreLastChangedAt = now;
+      restorePhase = VolumeTargetPhase::settling;
+    }
     return;
   }
   if (restoreLearningSuppressed) {
+    if (muteAutomaticFeedbackPending) {
+      restoreFailureRaw = raw;
+      return;
+    }
     const bool cooldownElapsed =
         timeReached(millis(), restoreLearningResumeAt);
     if (!cooldownElapsed) return;
@@ -941,52 +1412,261 @@ void observeVolume(uint8_t raw) {
     restoreLearningResumeAt = 0;
     restoreError = "";
   }
-  if (currentAppId.isEmpty() || !pendingAppId.isEmpty()) return;
+  if (currentAppId.isEmpty() || !pendingAppId.isEmpty() ||
+      !appVolumeLearningAllowed(
+          restoreTargetRaw, restoreLearningSuppressed, raw, muteStateKnown,
+          denonMuted, manualMuteLocked)) {
+    return;
+  }
   rememberAppVolume(currentAppId, currentAppName, raw, false);
 }
 
+void maintainAutomaticRemute(unsigned long now) {
+  if (!automaticRemuteRequired || restoreAutomaticMuteCycle ||
+      !serialBt.connected() || !sessionInitialized || !muteStateKnown) {
+    return;
+  }
+  if (!timeReached(now, automaticRemuteNotBefore)) return;
+  if (now - automaticMuteCommandAt < kVolumeMovementStatusDelayMs) return;
+  if (sendDenon(kMuteOn, sizeof(kMuteOn))) {
+    automaticMuteConfirmationPending = true;
+    muteStateKnown = false;
+    automaticMuteCommandAt = now;
+    nextStatusAt = now + kVolumeMovementStatusDelayMs;
+  }
+}
+
 void maintainVolumeRestore() {
-  if (restoreTargetRaw < 0) return;
   const unsigned long now = millis();
+  maintainAutomaticRemute(now);
+  if (automaticRemuteRequired && !restoreAutomaticMuteCycle) return;
+  if (restoreTargetRaw < 0) return;
+  if (!restoreSessionArmed || !serialBt.connected() || !sessionInitialized) {
+    return;
+  }
   if (timeReached(now, restoreDeadlineAt)) {
     failVolumeRestore("deadline_exceeded");
     return;
   }
-  if (!serialBt.connected() || volumeRaw < 0) return;
-  const int direction = restoreDirection(volumeRaw, restoreTargetRaw);
-  if (direction == 0) {
-    completeVolumeRestore();
+
+  if (restorePhase == VolumeTargetPhase::needFreshStatus) {
+    if (!sendDenon(kGetStatus, sizeof(kGetStatus))) {
+      failVolumeRestore("status_request_failed");
+      return;
+    }
+    restorePhase = VolumeTargetPhase::waitFreshStatus;
+    restorePhaseAt = now;
+    nextStatusAt = now + kStatusIntervalMs;
     return;
   }
-
-  if (restoreAwaitingFeedback) {
-    if (now - restoreSentAt < kRestoreFeedbackTimeoutMs) return;
-    if (!restoreStatusRequested) {
+  if (restorePhase == VolumeTargetPhase::waitFreshStatus) {
+    if (now - restorePhaseAt >= kVolumeStatusResponseTimeoutMs) {
+      failVolumeRestore("fresh_status_timeout");
+    }
+    return;
+  }
+  if (restorePhase == VolumeTargetPhase::waitAutomaticUnmute) {
+    if (!currentPlaybackIdleFresh(now)) {
+      failVolumeRestore("playback_authorization_expired");
+      return;
+    }
+    if (!muteStateKnown || !denonMuted || !manualMuteLocked || volumeRaw < 0) {
+      failVolumeRestore("mute_state_changed");
+      return;
+    }
+    const int direction = volumeDirection(volumeRaw, restoreTargetRaw);
+    if (direction == 0) {
+      completeVolumeRestore();
+      return;
+    }
+    if (!armAutomaticRemuteRecovery(now)) {
+      failVolumeRestore("remute_journal_failed");
+      return;
+    }
+    const uint8_t *command = direction > 0 ? kVolumeUp : kVolumeDown;
+    const size_t length = direction > 0 ? sizeof(kVolumeUp)
+                                         : sizeof(kVolumeDown);
+    const int rapidClicks = volumeRapidClickCount(
+        abs(restoreTargetRaw - volumeRaw), 0, 0);
+    if (!sendDenon(command, length)) {
+      failVolumeRestore("command_write_failed");
+      return;
+    }
+    muteStateKnown = false;
+    restoreObservedRaw = volumeRaw;
+    restoreCommandRaw = volumeRaw;
+    restoreCommandDirection = direction;
+    ++restoreSteps;
+    restoreCommandAt = now;
+    restorePhaseAt = now;
+    if (rapidClicks > 0) {
+      restoreBurstActive = true;
+      restoreBurstStartRaw = volumeRaw;
+      restoreBurstClicksPlanned = static_cast<uint8_t>(rapidClicks);
+      restoreBurstClicksSent = 1;
+      restorePhase = VolumeTargetPhase::waitBurstSecond;
+    } else {
+      restorePhase = VolumeTargetPhase::waitMovement;
+    }
+    return;
+  }
+  if (restoreAutomaticMuteCycle && !currentPlaybackIdleFresh(now)) {
+    if (playbackAuthorizationExpiryFails(volumeRaw, restoreTargetRaw)) {
+      failVolumeRestore("playback_authorization_expired");
+    } else {
+      completeVolumeRestore();
+    }
+    return;
+  }
+  if (restoreBurstExtensionPending &&
+      !automaticRestoreCommandAllowed()) {
+    restoreBurstExtensionPending = false;
+    restorePhase = VolumeTargetPhase::settling;
+    return;
+  }
+  if (!automaticRestoreCommandAllowed()) {
+    return;
+  }
+  if (restorePhase == VolumeTargetPhase::waitBurstSecond) {
+    const bool sendExtension = restoreBurstExtensionPending;
+    if (sendExtension &&
+        !volumeRapidExtensionAllowed(
+            restoreObservedRaw, restoreTargetRaw, restoreCommandDirection,
+            true, timeReached(now, restoreDeadlineAt), restoreSteps,
+            kRestoreMaxSteps)) {
+      restoreBurstExtensionPending = false;
+      restorePhase = VolumeTargetPhase::settling;
+      return;
+    }
+    if (now - restoreCommandAt < kVolumeRapidIntervalMs) return;
+    if (!sendExtension &&
+        restoreBurstClicksSent >= restoreBurstClicksPlanned) {
+      restorePhase = VolumeTargetPhase::waitMovement;
+      return;
+    }
+    if (restoreSteps >= kRestoreMaxSteps) {
+      failVolumeRestore("step_budget_exceeded");
+      return;
+    }
+    const uint8_t *command =
+        restoreCommandDirection > 0 ? kVolumeUp : kVolumeDown;
+    const size_t length = restoreCommandDirection > 0 ? sizeof(kVolumeUp)
+                                                       : sizeof(kVolumeDown);
+    if (sendExtension) {
+      restoreBurstActive = true;
+      restoreBurstStartRaw = restoreObservedRaw;
+      restoreBurstClicksPlanned = 1;
+      restoreBurstClicksSent = 0;
+      restoreBurstExtensionPending = false;
+    }
+    if (!sendDenon(command, length)) {
+      failVolumeRestore("command_write_failed");
+      return;
+    }
+    ++restoreSteps;
+    ++restoreBurstClicksSent;
+    restoreCommandAt = now;
+    restorePhaseAt = now;
+    if (restoreBurstClicksSent >= restoreBurstClicksPlanned) {
+      restorePhase = VolumeTargetPhase::waitMovement;
+    }
+    return;
+  }
+  if (restorePhase == VolumeTargetPhase::waitMovement ||
+      restorePhase == VolumeTargetPhase::waitMovementStatus) {
+    if (now - restoreCommandAt >= kVolumeStepResponseTimeoutMs) {
+      failVolumeRestore("movement_timeout");
+      return;
+    }
+    if (restorePhase == VolumeTargetPhase::waitMovement &&
+        now - restoreCommandAt >= kVolumeMovementStatusDelayMs) {
       if (!sendDenon(kGetStatus, sizeof(kGetStatus))) {
         failVolumeRestore("status_request_failed");
         return;
       }
-      restoreStatusRequested = true;
-      restoreSentAt = now;
-      return;
+      restorePhase = VolumeTargetPhase::waitMovementStatus;
+      restorePhaseAt = now;
+      nextStatusAt = now + kStatusIntervalMs;
     }
-    failVolumeRestore("feedback_timeout");
     return;
   }
-  if (!timeReached(now, nextRestoreAt)) return;
+  if (restorePhase == VolumeTargetPhase::settling) {
+    if (!volumeSettleWindowElapsed(now, restoreCommandAt,
+                                   restoreLastChangedAt)) {
+      return;
+    }
+    const int remainingDirection =
+        volumeDirection(restoreObservedRaw, restoreTargetRaw);
+    if (!restoreBurstActive &&
+        remainingDirection == restoreCommandDirection) {
+      restorePhase = VolumeTargetPhase::ready;
+      return;
+    }
+    if (!sendDenon(kGetStatus, sizeof(kGetStatus))) {
+      failVolumeRestore("status_request_failed");
+      return;
+    }
+    restorePhase = VolumeTargetPhase::waitConfirmation;
+    restorePhaseAt = now;
+    nextStatusAt = now + kStatusIntervalMs;
+    return;
+  }
+  if (restorePhase == VolumeTargetPhase::waitConfirmation) {
+    if (now - restorePhaseAt >= kVolumeStatusResponseTimeoutMs) {
+      failVolumeRestore("confirmation_timeout");
+    }
+    return;
+  }
+  if (restorePhase != VolumeTargetPhase::ready || restoreObservedRaw < 0) return;
+
+  const int direction = volumeDirection(restoreObservedRaw, restoreTargetRaw);
+  if (direction == 0) {
+    completeVolumeRestore();
+    return;
+  }
+  const bool movementObserved =
+      restoreCommandDirection != 0 &&
+      volumeMovementInDirection(restoreCommandRaw, restoreObservedRaw,
+                                restoreCommandDirection);
+  if (restoreSteps > 0 &&
+      (!movementObserved ||
+       !volumeSettleWindowElapsed(now, restoreCommandAt,
+                                  restoreLastChangedAt))) return;
+  if (restoreCommandDirection != 0 && direction != restoreCommandDirection) {
+    if (restoreCorrectiveReversalUsed) {
+      failVolumeRestore("corrective_reversal_exceeded");
+      return;
+    }
+    restoreCorrectiveReversalUsed = true;
+  }
   if (restoreSteps >= kRestoreMaxSteps) {
     failVolumeRestore("step_budget_exceeded");
     return;
   }
   const uint8_t *command = direction > 0 ? kVolumeUp : kVolumeDown;
   const size_t length = direction > 0 ? sizeof(kVolumeUp) : sizeof(kVolumeDown);
+  const int distanceRaw = abs(restoreTargetRaw - restoreObservedRaw);
+  const int rapidClicks =
+      restoreCoarseEnabled
+          ? volumeRapidClickCount(distanceRaw, restoreBurstMeasuredDeltaRaw,
+                                  restoreBurstMeasuredClicks)
+          : 0;
   if (sendDenon(command, length)) {
-    restoreCommandRaw = volumeRaw;
+    restoreCommandRaw = restoreObservedRaw;
+    restoreCommandDirection = direction;
     ++restoreSteps;
-    restoreAwaitingFeedback = true;
-    restoreStatusRequested = false;
-    restoreSentAt = now;
-    nextStatusAt = now + 300;
+    restoreCommandAt = now;
+    restorePhaseAt = now;
+    if (rapidClicks > 0) {
+      restoreBurstActive = true;
+      restoreBurstStartRaw = restoreObservedRaw;
+      restoreBurstClicksPlanned = static_cast<uint8_t>(rapidClicks);
+      restoreBurstClicksSent = 1;
+      restorePhase = VolumeTargetPhase::waitBurstSecond;
+    } else {
+      restorePhase = VolumeTargetPhase::waitMovement;
+    }
+    nextStatusAt = now + kStatusIntervalMs;
   } else {
     failVolumeRestore("command_write_failed");
   }
@@ -1005,6 +1685,17 @@ bool parseVolumePacket(const uint8_t *packet, size_t length, uint8_t &raw) {
   return true;
 }
 
+bool parseMutePacket(const uint8_t *packet, size_t length, bool &muted) {
+  if (length != 7 || packet[0] != 0x41 || packet[1] != 0x54 ||
+      (packet[2] != 0x07 && packet[2] != 0x57) || packet[3] != 0x1D ||
+      packet[4] != 0x01 ||
+      packet[5] > 1 || packet[6] != static_cast<uint8_t>(0xFF - packet[5])) {
+    return false;
+  }
+  muted = packet[5] == 1;
+  return true;
+}
+
 bool protocolSelfCheck() {
   constexpr uint8_t captured50[] = {0x41, 0x54, 0x07, 0x02, 0x03,
                                     0xC5, 0x64, 0x00, 0xD4};
@@ -1016,7 +1707,18 @@ bool protocolSelfCheck() {
                                      0xC5, 0x64, 0x00, 0xD4};
   constexpr uint8_t outOfRange[] = {0x41, 0x54, 0x07, 0x02, 0x03,
                                     0xC5, 0xC5, 0x00, 0x00};
+  constexpr uint8_t capturedMuteOn[] = {0x41, 0x54, 0x07, 0x1D,
+                                        0x01, 0x01, 0xFE};
+  constexpr uint8_t capturedMuteOff[] = {0x41, 0x54, 0x07, 0x1D,
+                                         0x01, 0x00, 0xFF};
+  constexpr uint8_t capturedX580MuteOn[] = {0x41, 0x54, 0x57, 0x1D,
+                                            0x01, 0x01, 0xFE};
+  constexpr uint8_t capturedX580MuteOff[] = {0x41, 0x54, 0x57, 0x1D,
+                                             0x01, 0x00, 0xFF};
+  constexpr uint8_t wrongMuteChecksum[] = {0x41, 0x54, 0x07, 0x1D,
+                                           0x01, 0x01, 0xFF};
   uint8_t raw = 0;
+  bool muted = false;
   return parseVolumePacket(captured50, sizeof(captured50), raw) && raw == 0x64 &&
          parseVolumePacket(captured50_5, sizeof(captured50_5), raw) &&
          raw == 0x65 &&
@@ -1024,7 +1726,18 @@ bool protocolSelfCheck() {
          raw == 0x64 &&
          !parseVolumePacket(wrongHeader, sizeof(wrongHeader), raw) &&
          !parseVolumePacket(outOfRange, sizeof(outOfRange), raw) &&
-         !parseVolumePacket(captured50, sizeof(captured50) - 1, raw);
+         !parseVolumePacket(captured50, sizeof(captured50) - 1, raw) &&
+         parseMutePacket(capturedMuteOn, sizeof(capturedMuteOn), muted) &&
+         muted &&
+         parseMutePacket(capturedMuteOff, sizeof(capturedMuteOff), muted) &&
+         !muted &&
+         parseMutePacket(capturedX580MuteOn, sizeof(capturedX580MuteOn),
+                         muted) &&
+         muted &&
+         parseMutePacket(capturedX580MuteOff, sizeof(capturedX580MuteOff),
+                         muted) &&
+         !muted &&
+         !parseMutePacket(wrongMuteChecksum, sizeof(wrongMuteChecksum), muted);
 }
 
 void clearPairingNumber() {
@@ -1192,6 +1905,8 @@ void maintainDenon() {
       wasDenonConnected = true;
       sessionInitialized = false;
       volumeRaw = -1;
+      muteStateKnown = false;
+      if (restoreTargetRaw >= 0) armVolumeTargetSession(now);
       nextStatusAt = now + 300;
     }
     if (timeReached(now, nextStatusAt)) {
@@ -1200,7 +1915,7 @@ void maintainDenon() {
         sendDenon(kGetSources, sizeof(kGetSources));
         sessionInitialized = true;
       }
-      sendDenon(kGetStatus, sizeof(kGetStatus));
+      if (restoreTargetRaw < 0) sendDenon(kGetStatus, sizeof(kGetStatus));
       nextStatusAt = now + kStatusIntervalMs;
     }
     return;
@@ -1210,6 +1925,15 @@ void maintainDenon() {
     wasDenonConnected = false;
     sessionInitialized = false;
     volumeRaw = -1;
+    muteStateKnown = false;
+    currentPlaybackIdleAuthorized = false;
+    pendingPlaybackIdleAuthorized = false;
+    if (restoreAutomaticMuteCycle || automaticRemuteRequired) {
+      automaticMuteConfirmationPending = false;
+      cancelVolumeRestore();
+    } else {
+      pauseVolumeTargetSession();
+    }
     nextReconnectAt = now + 1000;
     Serial.println("Denon disconnected");
   }
@@ -1250,7 +1974,17 @@ void readDenon() {
     bool consumed;
     do {
       consumed = false;
-      for (size_t i = 0; i + 9 <= length; ++i) {
+      for (size_t i = 0; i + 7 <= length; ++i) {
+        bool muted = false;
+        if (parseMutePacket(buffer + i, 7, muted)) {
+          observeMute(muted);
+          Serial.printf("Mute: %s\n", muted ? "on" : "off");
+          memmove(buffer, buffer + i + 7, length - (i + 7));
+          length -= i + 7;
+          consumed = true;
+          break;
+        }
+        if (i + 9 > length) continue;
         uint8_t raw = 0;
         if (!parseVolumePacket(buffer + i, 9, raw)) continue;
         volumeRaw = raw;
@@ -1359,27 +2093,47 @@ bool parseJsonString(const String &json, size_t &position, String &output) {
   return false;
 }
 
-bool parseAppJson(const String &json, String &appId, String &appName) {
+bool parseAppJson(const String &json, String &appId, String &appName,
+                  String &eventId, bool &playbackKnown,
+                  bool &playbackActive) {
   size_t position = 0;
   bool hasAppId = false;
   bool hasAppName = false;
+  playbackKnown = false;
+  playbackActive = false;
+  eventId = "";
   skipJsonWhitespace(json, position);
   if (position >= json.length() || json[position++] != '{') return false;
   skipJsonWhitespace(json, position);
   while (position < json.length() && json[position] != '}') {
     String key;
-    String value;
     if (!parseJsonString(json, position, key)) return false;
     skipJsonWhitespace(json, position);
     if (position >= json.length() || json[position++] != ':') return false;
     skipJsonWhitespace(json, position);
-    if (!parseJsonString(json, position, value)) return false;
-    if (key == "app_id") {
+    if (key == "playback_active") {
+      if (json.substring(position, position + 4) == "true") {
+        playbackActive = true;
+        position += 4;
+      } else if (json.substring(position, position + 5) == "false") {
+        playbackActive = false;
+        position += 5;
+      } else {
+        return false;
+      }
+      playbackKnown = true;
+    } else {
+      String value;
+      if (!parseJsonString(json, position, value)) return false;
+      if (key == "app_id") {
       appId = value;
       hasAppId = true;
-    } else if (key == "app_name") {
-      appName = value;
-      hasAppName = true;
+      } else if (key == "app_name") {
+        appName = value;
+        hasAppName = true;
+      } else if (key == "event_id") {
+        eventId = value;
+      }
     }
     skipJsonWhitespace(json, position);
     if (position < json.length() && json[position] == ',') {
@@ -1546,13 +2300,21 @@ bool parseBackupJson(const String &json, StoredAppVolume apps[kMaxApps],
 bool jsonSelfCheck() {
   String appId;
   String appName;
+  String eventId;
+  bool playbackKnown = false;
+  bool playbackActive = false;
   StoredAppVolume apps[kMaxApps];
   size_t count = 0;
   return parseAppJson(
-             "{\"app_id\":\"com.example.video\",\"app_name\":\"Video\"}",
-             appId, appName) &&
+             "{\"app_id\":\"com.example.video\",\"app_name\":\"Video\","
+             "\"event_id\":\"0123456789abcdef0123456789abcdef\","
+             "\"playback_active\":false}",
+             appId, appName, eventId, playbackKnown, playbackActive) &&
          appId == "com.example.video" && appName == "Video" &&
-         !parseAppJson("{\"app_id\":\"bad\",}", appId, appName) &&
+         eventId == "0123456789abcdef0123456789abcdef" && playbackKnown &&
+         !playbackActive &&
+         !parseAppJson("{\"app_id\":\"bad\",}", appId, appName,
+                       eventId, playbackKnown, playbackActive) &&
          parseBackupJson(
              "{\"schema\":1,\"apps\":[{\"app_id\":\"one\","
              "\"app_name\":\"One\",\"volume_raw\":100},{\"app_id\":"
@@ -1809,7 +2571,11 @@ void receiveApp() {
   }
   String appId;
   String appName;
-  if (!parseAppJson(server.arg("plain"), appId, appName)) {
+  String eventId;
+  bool playbackKnown = false;
+  bool playbackActive = false;
+  if (!parseAppJson(server.arg("plain"), appId, appName, eventId,
+                    playbackKnown, playbackActive)) {
     server.send(400, "text/plain",
                 "Expected JSON string fields app_id and app_name");
     return;
@@ -1830,20 +2596,40 @@ void receiveApp() {
     server.send(204);
     return;
   }
-  queueAppCandidate(appId, appName);
+  const bool validIdleEvent =
+      playbackKnown && !playbackActive &&
+      validPlaybackEventId(eventId.c_str(), eventId.length());
+  const bool manualTargetActive = restoreTargetRaw >= 0 && !restoreAutomatic;
+  if (validIdleEvent &&
+      !playbackIdleEventReady(
+          serialBt.connected(), sessionInitialized, volumeRaw, muteStateKnown,
+          denonMuted, manualMuteLocked, automaticRemuteRequired,
+          manualTargetActive)) {
+    server.send(503, "text/plain", "Receiver state is not ready for this event");
+    return;
+  }
+  queueAppCandidate(appId, appName, playbackKnown, playbackActive, eventId);
   server.send(202, "application/json", "{\"accepted\":true}");
 }
 
 const char *restoreStateText() {
+  if (automaticRemuteRequired && !restoreAutomaticMuteCycle) return "remuting";
   if (restoreTargetRaw >= 0) return "restoring";
   return restoreError.isEmpty() ? "idle" : "error";
 }
 
 void appendRestoreState(String &body) {
-  body += ",\"restoring\":" + String(restoreTargetRaw >= 0 ? "true" : "false") +
+  body += ",\"restoring\":" +
+          String((restoreTargetRaw >= 0 || automaticRemuteRequired) ? "true"
+                                                                    : "false") +
           ",\"restore_state\":\"" + restoreStateText() +
           "\",\"restore_error\":";
   body += restoreError.isEmpty() ? "null" : "\"" + jsonEscape(restoreError) + "\"";
+  body += ",\"mute_known\":" + String(muteStateKnown ? "true" : "false") +
+          ",\"muted\":";
+  body += muteStateKnown ? String(denonMuted ? "true" : "false") : "null";
+  body += ",\"manual_mute_lock\":" +
+          String(manualMuteLocked ? "true" : "false");
 }
 
 void sendApps() {
@@ -1916,19 +2702,68 @@ void sendState() {
   body += ",\"current_app_id\":";
   body += currentAppId.isEmpty() ? "null" : "\"" + jsonEscape(currentAppId) + "\"";
   appendRestoreState(body);
+  body += ",\"volume_target_id\":" + String(volumeTargetGeneration);
   body += ",\"ip\":\"" + jsonEscape(ip) + "\",\"network_mode\":\"" +
           String(staticNetworkEnabled ? "static" : "dhcp") +
           "\",\"hostname\":\"" + jsonEscape(hostName) + ".local\"}";
   server.send(200, "application/json", body);
 }
 
-void sendVolume(const uint8_t *command, size_t length) {
+void sendVolume(const uint8_t *command, size_t length, int direction) {
+  if (!requireManualVolumeAuthorization()) return;
+  if (automaticRemuteRequired ||
+      !volumeCommandAllowed(muteStateKnown, denonMuted, manualMuteLocked)) {
+    server.send(423, "text/plain",
+                "Unmute the Denon with its remote before changing volume");
+    return;
+  }
+  if (restoreTargetRaw >= 0) {
+    server.send(409, "text/plain", "Volume target is already in progress");
+    return;
+  }
   if (!sendDenon(command, length)) {
     server.send(503, "text/plain", "Receiver is not connected");
     return;
   }
+  acceptManualVolumeFeedback(direction);
+  cancelVolumeRestore();
   nextStatusAt = millis() + 300;
   server.send(204);
+}
+
+void sendTargetVolume() {
+  if (!requireManualVolumeAuthorization()) return;
+  if (automaticRemuteRequired ||
+      !volumeCommandAllowed(muteStateKnown, denonMuted, manualMuteLocked)) {
+    server.send(423, "text/plain",
+                "Unmute the Denon with its remote before changing volume");
+    return;
+  }
+  if (restoreTargetRaw >= 0) {
+    server.send(409, "text/plain", "Volume target is already in progress");
+    return;
+  }
+  String requested = server.arg("volume");
+  requested.trim();
+  uint8_t targetRaw = 0;
+  if (!parseDisplayedVolume(requested.c_str(), requested.length(), targetRaw)) {
+    server.send(400, "text/plain",
+                "Volume must be from 0.0 to 98.0 in 0.5 steps");
+    return;
+  }
+  if (!serialBt.connected() || volumeRaw < 0) {
+    server.send(503, "text/plain", "Receiver volume is not available");
+    return;
+  }
+  acceptManualVolumeFeedback(volumeDirection(volumeRaw, targetRaw));
+  if (!setVolume(targetRaw, false)) {
+    server.send(400, "text/plain", "Volume is out of range");
+    return;
+  }
+  server.send(202, "application/json",
+              "{\"accepted\":true,\"target_volume\":" +
+                  String(targetRaw / 2.0f, 1) + ",\"target_id\":" +
+                  String(volumeTargetGeneration) + "}");
 }
 
 void reconnectDenon() {
@@ -2192,8 +3027,8 @@ void clearNetwork() {
 }
 
 void setupWeb() {
-  const char *headers[] = {"Authorization", "If-Match"};
-  server.collectHeaders(headers, 2);
+  const char *headers[] = {"Authorization", "If-Match", "Origin", "Host"};
+  server.collectHeaders(headers, 4);
   server.on("/", HTTP_GET, sendPage);
   server.on("/api/info", HTTP_GET, sendInfo);
   server.on("/api/pair", HTTP_POST, pairApi);
@@ -2203,10 +3038,11 @@ void setupWeb() {
   server.on("/api/backup", HTTP_GET, sendBackup);
   server.on("/api/backup", HTTP_PUT, restoreBackup);
   server.on("/api/state", HTTP_GET, sendState);
+  server.on("/api/volume", HTTP_POST, sendTargetVolume);
   server.on("/api/volume/up", HTTP_POST,
-            [] { sendVolume(kVolumeUp, sizeof(kVolumeUp)); });
+            [] { sendVolume(kVolumeUp, sizeof(kVolumeUp), 1); });
   server.on("/api/volume/down", HTTP_POST,
-            [] { sendVolume(kVolumeDown, sizeof(kVolumeDown)); });
+            [] { sendVolume(kVolumeDown, sizeof(kVolumeDown), -1); });
   server.on("/api/denon/reconnect", HTTP_POST, reconnectDenon);
   server.on("/api/discover", HTTP_GET, discoverDenon);
   server.on("/api/denon", HTTP_POST, saveDenon);
@@ -2229,6 +3065,9 @@ void setup() {
     return;
   }
   preferences.begin("denon", false);
+  automaticRemuteRequired = preferences.getBool("remute", false);
+  automaticRemuteJournalPersisted = automaticRemuteRequired;
+  restoreLearningSuppressed = automaticRemuteRequired;
   loadDeviceIdentity();
   loadAppVolumes();
   loadDenonMac();
@@ -2251,6 +3090,7 @@ void loop() {
   if (setupApRunning) dnsServer.processNextRequest();
   maintainWifi();
   if (bluetoothReady) readDenon();
+  maintainManualMuteLock();
   maintainAppSwitch();
   maintainVolumeRestore();
   maintainAppStorage();

@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en" data-version="9">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Live local status and system map for Apple TV per-app Denon volume control">
+  <title>Denon project map</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080b10;
+      --surface: #0f141c;
+      --surface-2: #151c26;
+      --border: #263242;
+      --text: #edf3f8;
+      --muted: #93a2b4;
+      --blue: #55a7ff;
+      --green: #5bd6a2;
+      --amber: #f2bd59;
+      --red: #ff6f79;
+      --slate: #718096;
+      --shadow: 0 18px 50px rgba(0, 0, 0, .28);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body { margin: 0; background: radial-gradient(circle at 50% -20%, #142237 0, var(--bg) 42%); color: var(--text); }
+    button { font: inherit; }
+    .shell { width: min(1500px, 100%); margin: 0 auto; padding: 28px clamp(16px, 3vw, 42px) 64px; }
+    .topbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 22px; }
+    .eyebrow { color: var(--blue); font-size: 12px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; }
+    h1 { margin: 6px 0 8px; font-size: clamp(28px, 4vw, 46px); line-height: 1.04; font-weight: 650; letter-spacing: -.035em; }
+    h2 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -.01em; }
+    h3 { margin: 0; font-size: 15px; font-weight: 600; }
+    p { margin: 0; }
+    .summary { max-width: 820px; color: var(--muted); line-height: 1.55; }
+    .live { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; white-space: nowrap; padding-top: 8px; }
+    .live-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 5px rgba(91,214,162,.12); }
+    .live-dot.offline { background: var(--red); box-shadow: 0 0 0 5px rgba(255,111,121,.12); }
+
+    .glance { margin: 0 0 28px; }
+    .glance > h2 { margin-bottom: 12px; }
+    .glance-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 12px; }
+    .glance-card { min-width: 0; background: rgba(15,20,28,.92); border: 1px solid var(--border); border-radius: 14px; padding: 15px; box-shadow: var(--shadow); }
+    .glance-card h3 { margin-bottom: 10px; }
+    .glance-card.now h3 { color: var(--blue); }
+    .glance-card.waiting h3 { color: var(--red); }
+    .glance-card.finished h3 { color: var(--green); }
+    .glance-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+    .glance-list li { min-width: 0; color: var(--muted); font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }
+
+    .tasks { display: grid; gap: 14px; margin: 22px 0 28px; }
+    .task { background: rgba(15,20,28,.92); border: 1px solid var(--border); border-radius: 16px; padding: 17px; box-shadow: var(--shadow); }
+    .task-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+    .status { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    .status-done { color: var(--green); }
+    .status-active { color: var(--blue); }
+    .status-blocked { color: var(--red); }
+    .status-pending { color: var(--slate); }
+    .task-list { list-style: none; display: grid; gap: 0; margin: 15px 0 0; padding: 0; border: 1px solid var(--border); border-radius: 11px; background: rgba(8,11,16,.45); overflow: hidden; }
+    .task-item { min-width: 0; display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 12px; align-items: start; padding: 11px 13px; }
+    .task-item + .task-item { border-top: 1px solid var(--border); }
+    .task-item .status { padding-top: 2px; }
+    .task-copy { min-width: 0; color: var(--muted); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+
+    .section-head { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; margin: 24px 0 13px; }
+    .section-head p { color: var(--muted); font-size: 13px; }
+    .map-shell { position: relative; background: rgba(10,14,20,.76); border: 1px solid var(--border); border-radius: 18px; padding: 26px; overflow: hidden; min-height: 760px; }
+    #edges { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; }
+    .edge { fill: none; stroke: #405066; stroke-width: 2; opacity: .82; marker-end: url(#arrow); }
+    .edge.active { stroke: var(--blue); }
+    .edge.done { stroke: var(--green); }
+    .edge.blocked { stroke: var(--red); stroke-dasharray: 5 5; }
+    .edge.pending { stroke: var(--slate); stroke-dasharray: 3 6; }
+    .edge-leader { fill: none; stroke: #52637a; stroke-width: 1.5; stroke-dasharray: 2 4; opacity: .9; }
+    .edge-label-box { fill: rgba(8,11,16,.96); stroke: #405066; stroke-width: 1; }
+    .edge-label { fill: var(--text); font-size: 10px; font-weight: 550; text-anchor: middle; dominant-baseline: middle; }
+    .flow-grid { position: relative; z-index: 1; display: grid; grid-template-columns: repeat(6, minmax(130px, 1fr)); grid-template-rows: repeat(4, 115px); grid-template-areas: "apple tunnel collector mqtt . ." ". . . mqttconfig sensor relay" ". denon spp controller memory api" ". . . web . connectivity"; column-gap: clamp(24px, 3vw, 54px); row-gap: 70px; align-items: stretch; }
+    .node { position: relative; width: 100%; min-height: 104px; text-align: left; color: var(--text); background: rgba(21,28,38,.98); border: 1px solid var(--border); border-radius: 13px; padding: 14px; cursor: pointer; box-shadow: 0 10px 26px rgba(0,0,0,.2); transition: transform .15s ease, border-color .15s ease, background .15s ease; }
+    .node:hover, .node:focus-visible { transform: translateY(-2px); border-color: #50647d; background: #192331; outline: none; }
+    .node.selected { border-color: var(--blue); box-shadow: 0 0 0 2px rgba(85,167,255,.16); }
+    .node-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+    .node-kind { color: var(--muted); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
+    .node-location { margin-top: 8px; color: var(--muted); font-size: 11px; line-height: 1.35; }
+    [data-node="apple-tv-device"] { grid-area: apple; }
+    [data-node="rsd-tunnel"] { grid-area: tunnel; }
+    [data-node="collector"] { grid-area: collector; }
+    [data-node="mosquitto"] { grid-area: mqtt; }
+    [data-node="mqtt-config"] { grid-area: mqttconfig; }
+    [data-node="mqtt-sensor"] { grid-area: sensor; }
+    [data-node="ha-relay"] { grid-area: relay; }
+    [data-node="esp-api"] { grid-area: api; }
+    [data-node="app-memory"] { grid-area: memory; }
+    [data-node="volume-controller"] { grid-area: controller; }
+    [data-node="bluetooth-spp"] { grid-area: spp; }
+    [data-node="denon"] { grid-area: denon; }
+    [data-node="web-ui"] { grid-area: web; }
+    [data-node="esp-connectivity"] { grid-area: connectivity; }
+
+    .below { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(320px, .8fr); gap: 16px; margin-top: 16px; }
+    .panel { background: rgba(15,20,28,.88); border: 1px solid var(--border); border-radius: 16px; padding: 17px; }
+    .detail-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .detail-copy { color: var(--muted); margin-top: 10px; line-height: 1.55; font-size: 13px; }
+    .detail-evidence { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); color: var(--text); font-size: 13px; line-height: 1.5; }
+    .timeline { list-style: none; margin: 13px 0 0; padding: 0; display: grid; gap: 12px; }
+    .timeline li { display: grid; grid-template-columns: 42px 8px 1fr; gap: 10px; align-items: start; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .timeline time { color: var(--text); font-variant-numeric: tabular-nums; }
+    .timeline-dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 4px; background: var(--slate); }
+    .timeline-dot.done { background: var(--green); }
+    .timeline-dot.active { background: var(--blue); }
+    .timeline-dot.blocked { background: var(--red); }
+
+    .error { color: var(--red); padding: 24px; }
+
+    @media (max-width: 1040px) {
+      .map-shell { min-height: 980px; }
+      .flow-grid { grid-template-columns: repeat(3, minmax(150px, 1fr)); grid-template-rows: repeat(5, 120px); grid-template-areas: "apple tunnel collector" "mqtt mqttconfig sensor" "relay api memory" "denon spp controller" "web connectivity ."; row-gap: 68px; }
+      .below { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 660px) {
+      .shell { padding: 20px 12px 44px; }
+      .topbar { flex-direction: column; }
+      .live { padding-top: 0; }
+      .map-shell { padding: 14px; min-height: 0; }
+      .flow-grid { display: flex; flex-direction: column; gap: 10px; }
+      #edges { display: none; }
+      .task-head { align-items: flex-start; }
+      .task-item { grid-template-columns: 1fr; gap: 4px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">Live local project map</div>
+        <h1 id="project-name">Denon project map</h1>
+        <p class="summary" id="project-summary">Loading current project state…</p>
+      </div>
+      <div class="live" aria-live="polite">
+        <span class="live-dot" id="live-dot"></span>
+        <span id="live-text">Connecting…</span>
+      </div>
+    </header>
+
+    <section class="glance" aria-labelledby="glance-title">
+      <h2 id="glance-title">At a glance</h2>
+      <div class="glance-grid">
+        <section class="glance-card now"><h3>Happening now</h3><ul class="glance-list" id="glance-now"></ul></section>
+        <section class="glance-card waiting"><h3>Still pending or blocked</h3><ul class="glance-list" id="glance-waiting"></ul></section>
+        <section class="glance-card finished"><h3>Already completed</h3><ul class="glance-list" id="glance-finished"></ul></section>
+      </div>
+    </section>
+
+    <section aria-labelledby="map-title">
+      <div class="section-head">
+        <h2 id="map-title">End-to-end system flow</h2>
+        <p>Arrows show runtime direction. The lower return path is measured volume feedback.</p>
+      </div>
+      <div class="map-shell" id="map-shell">
+        <svg id="edges" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/></marker></defs></svg>
+        <div class="flow-grid" id="flow-grid"></div>
+      </div>
+    </section>
+
+    <section aria-labelledby="tasks-title">
+      <div class="section-head">
+        <h2 id="tasks-title">Workstreams</h2>
+        <p>Each workstream keeps every item in one labeled list.</p>
+      </div>
+      <div class="tasks" id="tasks"></div>
+    </section>
+
+    <div class="below">
+      <section class="panel" aria-labelledby="detail-title">
+        <div class="detail-title">
+          <h2 id="detail-title">Selected component</h2>
+          <span class="status status-active" id="detail-status">Active</span>
+        </div>
+        <p class="detail-copy" id="detail-copy">Select a component in the map.</p>
+        <p class="detail-evidence" id="detail-evidence"></p>
+      </section>
+      <section class="panel" aria-labelledby="timeline-title">
+        <h2 id="timeline-title">Latest evidence</h2>
+        <ol class="timeline" id="timeline"></ol>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const lanes = [
+      ["detection", "Foreground detection"],
+      ["handoff", "State handoff"],
+      ["control", "Volume control"],
+      ["device", "Physical device"]
+    ];
+    let state = null;
+    let selected = null;
+    let lastVersion = "";
+
+    const esc = value => String(value ?? "").replace(/[&<>'"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
+    const statusClass = status => `status status-${status}`;
+    const statusLabel = status => status.charAt(0).toUpperCase() + status.slice(1);
+
+    const taskDispositions = [
+      ["done", "Done"],
+      ["active", "In progress"],
+      ["pending", "Pending"],
+      ["blocked", "Blocked"]
+    ];
+
+    const taskItems = task => taskDispositions.flatMap(([disposition, label]) =>
+      task[disposition].map(item => `
+        <li class="task-item ${disposition}">
+          <span class="${statusClass(disposition)}">${label}</span>
+          <span class="task-copy">${esc(item)}</span>
+        </li>`)
+    ).join("");
+
+    function renderGlance() {
+      const evidence = status => state.evidence.find(item => item.status === status)?.text;
+      const taskItem = disposition => state.tasks.flatMap(task => task[disposition]).at(0);
+      const set = (id, copy, fallback) => document.getElementById(id).innerHTML = `<li>${esc(copy || fallback)}</li>`;
+      set("glance-now", evidence("active") || taskItem("active"), "Nothing is running.");
+      set("glance-waiting", evidence("pending") || evidence("blocked") || taskItem("pending") || taskItem("blocked"), "Nothing is waiting.");
+      set("glance-finished", evidence("done") || taskItem("done"), "Nothing is complete yet.");
+    }
+
+    function renderTasks() {
+      document.getElementById("tasks").innerHTML = state.tasks.map(task => `
+        <article class="task ${esc(task.status)}">
+          <div class="task-head"><h3>${esc(task.name)}</h3><span class="${statusClass(task.status)}">${statusLabel(task.status)}</span></div>
+          <ul class="task-list">${taskItems(task)}</ul>
+        </article>`).join("");
+    }
+
+    function renderMap() {
+      const target = document.getElementById("flow-grid");
+      target.innerHTML = state.nodes.map(node => `
+          <button class="node${selected === node.id ? " selected" : ""}" type="button" data-node="${esc(node.id)}">
+            <div class="node-top"><h3>${esc(node.name)}</h3><span class="${statusClass(node.status)}">${statusLabel(node.status)}</span></div>
+            <div class="node-kind">${esc(node.kind)}</div>
+            <div class="node-location">${esc(node.location)}</div>
+          </button>`).join("");
+      document.querySelectorAll("[data-node]").forEach(button => button.addEventListener("click", () => selectNode(button.dataset.node)));
+      requestAnimationFrame(drawEdges);
+    }
+
+    function drawEdges() {
+      const svg = document.getElementById("edges");
+      const shell = document.getElementById("map-shell");
+      const bounds = shell.getBoundingClientRect();
+      const nodeRects = [...document.querySelectorAll(".node")].map(node => ({
+        node,
+        rect: node.getBoundingClientRect()
+      }));
+      const relative = rect => ({
+        left: rect.left - bounds.left,
+        top: rect.top - bounds.top,
+        right: rect.right - bounds.left,
+        bottom: rect.bottom - bounds.top
+      });
+      const nodes = nodeRects.map(item => relative(item.rect));
+      const labelSize = label => ({width: Math.max(52, label.length * 6 + 16), height: 24});
+      const overlapsNode = (x, y, size) => nodes.some(node =>
+        x + size.width / 2 > node.left && x - size.width / 2 < node.right &&
+        y + size.height / 2 > node.top && y - size.height / 2 < node.bottom
+      );
+      const freeGapCenters = (minY, maxY, size) => {
+        const gaps = [];
+        for (const upper of nodes) for (const lower of nodes) {
+          if (lower.top <= upper.bottom + 2) continue;
+          const top = upper.bottom;
+          const bottom = lower.top;
+          const center = (top + bottom) / 2;
+          if (bottom - top >= size.height + 4 && center >= minY && center <= maxY) gaps.push(center);
+        }
+        return gaps;
+      };
+      const cubic = (p1, p2, p3, p4, t) => {
+        const u = 1 - t;
+        return {
+          x: u ** 3 * p1.x + 3 * u ** 2 * t * p2.x + 3 * u * t ** 2 * p3.x + t ** 3 * p4.x,
+          y: u ** 3 * p1.y + 3 * u ** 2 * t * p2.y + 3 * u * t ** 2 * p3.y + t ** 3 * p4.y
+        };
+      };
+      svg.setAttribute("viewBox", `0 0 ${bounds.width} ${bounds.height}`);
+      const definitions = `<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/></marker></defs>`;
+      svg.innerHTML = definitions + state.edges.map(edge => {
+        const from = document.querySelector(`[data-node="${CSS.escape(edge.from)}"]`);
+        const to = document.querySelector(`[data-node="${CSS.escape(edge.to)}"]`);
+        if (!from || !to) return "";
+        const a = from.getBoundingClientRect();
+        const b = to.getBoundingClientRect();
+        const sameRow = Math.abs((a.top + a.height / 2) - (b.top + b.height / 2)) < 36;
+        const size = labelSize(edge.label);
+        let x1, y1, x2, y2, path, labelX, labelY, leaderPoint;
+        if (edge.route === "feedback") {
+          x1 = a.left + a.width / 2 - bounds.left;
+          y1 = a.bottom - bounds.top;
+          x2 = b.left + b.width / 2 - bounds.left;
+          y2 = b.bottom - bounds.top;
+          const low = Math.max(y1, y2, ...nodes.map(node => node.bottom)) + 24;
+          const curve = Math.min(36, Math.max(12, (low - Math.max(y1, y2)) * .35));
+          path = `M ${x1} ${y1} C ${x1} ${y1 + curve}, ${x1} ${low - curve}, ${x1} ${low} L ${x2} ${low} C ${x2} ${low - curve}, ${x2} ${y2 + curve}, ${x2} ${y2}`;
+          labelX = (x1 + x2) / 2;
+          leaderPoint = {x: labelX, y: low};
+          labelY = low + size.height / 2 + 7;
+        } else if (sameRow) {
+          const forward = b.left > a.left;
+          x1 = (forward ? a.right : a.left) - bounds.left;
+          y1 = a.top + a.height / 2 - bounds.top;
+          x2 = (forward ? b.left : b.right) - bounds.left;
+          y2 = b.top + b.height / 2 - bounds.top;
+          const bend = Math.max(28, Math.abs(x2 - x1) * .45);
+          path = `M ${x1} ${y1} C ${x1 + (forward ? bend : -bend)} ${y1}, ${x2 + (forward ? -bend : bend)} ${y2}, ${x2} ${y2}`;
+          labelX = (x1 + x2) / 2;
+          const nextRows = nodeRects.map(item => item.rect.top).filter(top => top > Math.max(a.bottom, b.bottom) + 2);
+          const nextRowTop = (nextRows.length ? Math.min(...nextRows) : bounds.bottom - 8) - bounds.top;
+          const gapTop = Math.max(a.bottom, b.bottom) - bounds.top;
+          labelY = gapTop + (nextRows.length ? 18 : (nextRowTop - gapTop) / 2);
+          leaderPoint = {x: labelX, y: (y1 + y2) / 2};
+        } else {
+          const down = b.top > a.top;
+          x1 = a.left + a.width / 2 - bounds.left;
+          y1 = (down ? a.bottom : a.top) - bounds.top;
+          x2 = b.left + b.width / 2 - bounds.left;
+          y2 = (down ? b.top : b.bottom) - bounds.top;
+          const bend = Math.max(34, Math.abs(y2 - y1) * .46);
+          path = `M ${x1} ${y1} C ${x1} ${y1 + (down ? bend : -bend)}, ${x2} ${y2 + (down ? -bend : bend)}, ${x2} ${y2}`;
+          labelX = (x1 + x2) / 2 + 8;
+          labelY = (y1 + y2) / 2;
+          if (overlapsNode(labelX, labelY, size)) {
+            const candidates = freeGapCenters(Math.min(y1, y2), Math.max(y1, y2), size)
+              .filter(candidate => !overlapsNode(labelX, candidate, size));
+            if (candidates.length) labelY = candidates.sort((left, right) => Math.abs(left - labelY) - Math.abs(right - labelY))[0];
+          }
+          const t = Math.max(0, Math.min(1, (labelY - y1) / (y2 - y1 || 1)));
+          leaderPoint = cubic(
+            {x: x1, y: y1},
+            {x: x1, y: y1 + (down ? bend : -bend)},
+            {x: x2, y: y2 + (down ? -bend : bend)},
+            {x: x2, y: y2},
+            t
+          );
+        }
+        const boxTop = labelY - size.height / 2;
+        const boxLeft = labelX - size.width / 2;
+        const leaderStartY = labelY > leaderPoint.y ? boxTop : boxTop + size.height;
+        const leader = Math.abs(labelY - leaderPoint.y) > 5
+          ? `<path class="edge-leader ${esc(edge.status)}" d="M ${labelX} ${leaderStartY} L ${leaderPoint.x} ${leaderPoint.y}"/>`
+          : "";
+        return `<path class="edge ${esc(edge.status)}" d="${path}"/>${leader}<g class="edge-annotation"><rect class="edge-label-box" x="${boxLeft}" y="${boxTop}" width="${size.width}" height="${size.height}" rx="7"/><text class="edge-label" x="${labelX}" y="${labelY}">${esc(edge.label)}</text></g>`;
+      }).join("");
+    }
+
+    function selectNode(id) {
+      selected = id;
+      const node = state.nodes.find(item => item.id === id);
+      document.querySelectorAll("[data-node]").forEach(button => button.classList.toggle("selected", button.dataset.node === id));
+      document.getElementById("detail-title").textContent = node.name;
+      const badge = document.getElementById("detail-status");
+      badge.className = statusClass(node.status);
+      badge.textContent = statusLabel(node.status);
+      document.getElementById("detail-copy").textContent = node.detail;
+      document.getElementById("detail-evidence").textContent = node.evidence;
+    }
+
+    function renderTimeline() {
+      document.getElementById("timeline").innerHTML = state.evidence.map(item => `
+        <li><time>${esc(item.time)}</time><span class="timeline-dot ${esc(item.status)}"></span><span>${esc(item.text)}</span></li>`).join("");
+    }
+
+    function render() {
+      document.getElementById("project-name").textContent = state.project.name;
+      document.getElementById("project-summary").textContent = state.project.summary;
+      renderGlance();
+      renderTasks();
+      renderMap();
+      renderTimeline();
+      selectNode(selected && state.nodes.some(node => node.id === selected) ? selected : state.nodes[0].id);
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch(`status.json?ts=${Date.now()}`, {cache: "no-store"});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const next = await response.json();
+        const version = next.project.updated_at;
+        state = next;
+        if (version !== lastVersion) {
+          lastVersion = version;
+          render();
+        }
+        document.getElementById("live-dot").classList.remove("offline");
+        document.getElementById("live-text").textContent = `Live · updated ${new Date(version).toLocaleTimeString()}`;
+      } catch (error) {
+        document.getElementById("live-dot").classList.add("offline");
+        document.getElementById("live-text").textContent = "Status feed disconnected";
+        if (!state) document.getElementById("project-summary").innerHTML = `<span class="error">Could not load status.json</span>`;
+      }
+    }
+
+    async function refreshShell() {
+      try {
+        const html = await fetch(`index.html?ts=${Date.now()}`, {cache: "no-store"}).then(response => response.text());
+        const version = html.match(/<html[^>]+data-version="([^"]+)"/i)?.[1];
+        if (version && version !== document.documentElement.dataset.version) location.reload();
+      } catch {}
+    }
+
+    window.addEventListener("resize", () => requestAnimationFrame(drawEdges));
+    refresh();
+    setInterval(refresh, 1000);
+    setInterval(refreshShell, 2000);
+  </script>
+</body>
+</html>

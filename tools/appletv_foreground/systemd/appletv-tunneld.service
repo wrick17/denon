@@ -1,0 +1,17 @@
+[Unit]
+Description=Apple TV pymobiledevice3 tunnel
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/home/dietpi
+Environment=SUDO_USER=dietpi
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/appletv-foreground/.venv/bin/python -m pymobiledevice3 remote tunneld --no-usb --no-usbmux --no-mobdev2
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

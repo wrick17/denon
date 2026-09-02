@@ -15,7 +15,7 @@ MAC = re.compile(
     r"(?i)(?<![0-9a-f])(?:[0-9a-f]{2}([:-]))(?:[0-9a-f]{2}\1){4}"
     r"[0-9a-f]{2}(?![0-9a-f])"
 )
-ENTITY_ID = re.compile(r"\bmedia_player\.([a-z0-9_]+)\b")
+ENTITY_ID = re.compile(r"\b(media_player|sensor)\.([a-z0-9_]+)\b")
 JWT = re.compile(
     r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
 )
@@ -88,8 +88,10 @@ def findings(path: Path, text: str) -> list[str]:
         if MAC.search(line):
             found.append(f"{path.relative_to(ROOT)}:{line_number}: MAC address literal")
         entity_id = ENTITY_ID.search(line)
-        if entity_id and not entity_id.group(1).startswith("example_"):
-            found.append(f"{path.relative_to(ROOT)}:{line_number}: media_player entity ID")
+        if entity_id and not entity_id.group(2).startswith("example_"):
+            found.append(
+                f"{path.relative_to(ROOT)}:{line_number}: {entity_id.group(1)} entity ID"
+            )
         if JWT.search(line) or BEARER.search(line):
             found.append(f"{path.relative_to(ROOT)}:{line_number}: token literal")
         token = TOKEN_VALUE.search(line)
@@ -128,21 +130,23 @@ def self_test() -> None:
     loopback = ".".join(str(part) for part in (127, 0, 0, 1))
     mac = ":".join(("AA", "BB", "CC", "DD", "EE", "FF"))
     entity = "media_" + "player.living_room"
+    sensor = "sen" + "sor.apple_tv_foreground"
     jwt = "eyJ" + "a" * 8 + "." + "b" * 8 + "." + "c" * 8
     wifi = '#define WIFI_' + 'SSID "real-network"'
     subnet = "subnet = " + ".".join(("255", "255", "255", "0"))
     dns = "dns_server = " + ".".join(("8", "8", "8", "8"))
     constructor = "IPAddress localIp(" + ", ".join(("10", "1", "2", "3")) + ")"
     sample = "\n".join(
-        (private_ip, mac, entity, jwt, wifi, subnet, dns, constructor)
+        (private_ip, mac, entity, sensor, jwt, wifi, subnet, dns, constructor)
     )
     reasons = findings(ROOT / "sample", sample)
-    assert len(reasons) == 8, reasons
+    assert len(reasons) == 9, reasons
     assert not findings(ROOT / "sample", loopback)
     assert not findings(ROOT / "sample", "gateway = 203.0.113.1")
     assert not findings(ROOT / "sample", '#define WIFI_SSID ""')
     assert not findings(ROOT / "sample", 'access_token: "<HOME_ASSISTANT_TOKEN>"')
     assert not findings(ROOT / "sample", "media_player.example_apple_tv")
+    assert not findings(ROOT / "sample", "sensor.example_apple_tv_foreground")
 
 
 def main() -> int:

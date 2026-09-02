@@ -12,9 +12,19 @@ from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.denon_app_volume.api import DeviceInfo
+from custom_components.denon_app_volume.config_flow import _APP_SOURCE_SELECTOR
 from custom_components.denon_app_volume.const import DOMAIN
 
 APPLE_TV_ENTITY_ID = "media_player.example_apple_tv"
+MQTT_ENTITY_ID = "sensor.example_apple_tv_foreground"
+
+
+def test_app_source_selector_is_limited_to_supported_entities() -> None:
+    """Offer the stock Apple TV entity and the MQTT foreground-app sensor."""
+    assert _APP_SOURCE_SELECTOR.config["filter"] == [
+        {"domain": ["media_player"], "integration": "apple_tv"},
+        {"domain": ["sensor"], "integration": "mqtt"},
+    ]
 
 
 def _discovery(ip: str = "192.0.2.5") -> ZeroconfServiceInfo:
@@ -158,6 +168,47 @@ async def test_rediscovery_updates_only_address(hass: HomeAssistant) -> None:
     assert result["reason"] == "already_configured"
     assert entry.data[CONF_HOST] == "192.0.2.5"
     assert entry.data[CONF_TOKEN] == "c" * 64
+
+
+async def test_reconfigure_updates_only_source_and_reloads(
+    hass: HomeAssistant,
+) -> None:
+    """Reconfigure the source without changing the paired device data."""
+    original_data = {
+        CONF_HOST: "denon-volume.local",
+        CONF_PORT: 80,
+        CONF_TOKEN: "d" * 64,
+        CONF_ENTITY_ID: APPLE_TV_ENTITY_ID,
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="device-1",
+        state=ConfigEntryState.LOADED,
+        data=original_data,
+    )
+    entry.add_to_hass(hass)
+
+    with patch.object(hass.config_entries, "async_schedule_reload") as reload_entry:
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "reconfigure"
+        field = next(iter(result["data_schema"].schema))
+        assert field.description == {"suggested_value": APPLE_TV_ENTITY_ID}
+
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_ENTITY_ID: MQTT_ENTITY_ID}
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data == {**original_data, CONF_ENTITY_ID: MQTT_ENTITY_ID}
+    reload_entry.assert_called_once_with(entry.entry_id)
 
 
 async def test_reauth_pairs_after_physical_token_reset(hass: HomeAssistant) -> None:

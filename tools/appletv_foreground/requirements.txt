@@ -1,0 +1,2 @@
+paho-mqtt==2.1.0
+pymobiledevice3==11.3.0
