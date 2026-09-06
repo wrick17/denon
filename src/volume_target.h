@@ -90,6 +90,12 @@ inline bool canResumeLearningAfterFailure(bool cooldownElapsed, int failedRaw,
   return cooldownElapsed && failedRaw >= 0 && observedRaw != failedRaw;
 }
 
+inline bool learningFailureBaselineNeedsRefresh(bool quietElapsed,
+                                                int failedRaw,
+                                                uint8_t observedRaw) {
+  return failedRaw < 0 || (!quietElapsed && observedRaw != failedRaw);
+}
+
 inline bool manualMuteLockClearsOnVolume(bool locked, int lockedRaw,
                                          int observedRaw,
                                          bool automaticFeedbackPending) {

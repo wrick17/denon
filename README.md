@@ -166,6 +166,14 @@ change its state. A failed or ambiguous DVT snapshot makes the MQTT sensor
 unavailable and preserves the last retained identity rather than publishing a
 false clear.
 
+A brief ambiguous reading during an ordinary app switch does not add a recovery
+delay: if the previous accepted sample is at most one second old and a unique
+app returns within one second of the first ambiguous reading, it is published
+immediately. Availability remains offline until that fresh reading arrives.
+Screensaver clears, connection failures, malformed snapshots, and longer gaps
+retain the three-second stable-app guard. The screensaver itself never selects
+a volume; returning to the same app at its saved volume sends no volume steps.
+
 ### 5. Add the discovered device
 
 1. Open **Settings > Devices & services** in Home Assistant.

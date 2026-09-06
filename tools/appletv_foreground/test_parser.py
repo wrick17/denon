@@ -73,6 +73,77 @@ class ForegroundTrackerTest(unittest.TestCase):
         self.assertTrue(guard.accepts("com.netflix.Netflix", 50.0))
         self.assertTrue(guard.accepts("com.apple.HeadBoard", 50.1))
 
+    def test_brief_dvt_ambiguity_does_not_add_settle_delay(self) -> None:
+        guard = DvtSettleGuard(3.0, ambiguity_seconds=1.0)
+        self.assertTrue(guard.accepts("com.apple.HeadBoard", 10.0))
+
+        guard.ambiguous(10.5)
+        guard.ambiguous(10.9)
+
+        self.assertTrue(guard.accepts("com.netflix.Netflix", 11.49))
+
+    def test_full_guard_cannot_be_shortcut_by_ambiguity(self) -> None:
+        guard = DvtSettleGuard(3.0, ambiguity_seconds=1.0)
+        self.assertTrue(guard.accepts("com.apple.HeadBoard", 15.0))
+        guard.arm()
+        guard.ambiguous(15.1)
+
+        self.assertFalse(guard.accepts("com.netflix.Netflix", 15.2))
+
+    def test_transport_outage_during_grace_uses_full_guard(self) -> None:
+        guard = DvtSettleGuard(3.0, ambiguity_seconds=1.0)
+        self.assertTrue(guard.accepts("com.apple.HeadBoard", 17.0))
+        guard.ambiguous(17.5)
+        guard.arm()
+
+        self.assertFalse(guard.accepts("com.netflix.Netflix", 17.6))
+
+    def test_brief_ambiguity_same_app_resume_reuses_state(self) -> None:
+        guard = DvtSettleGuard(3.0, ambiguity_seconds=1.0)
+        tracker = ForegroundTracker()
+        state = ForegroundState(required_source="dvt")
+        event_at = datetime(2026, 9, 6, tzinfo=timezone.utc)
+        payload = _state_payload(
+            "com.netflix.Netflix", "2026-09-06T00:00:00.000Z", "e" * 32
+        )
+        self.assertTrue(guard.accepts("com.netflix.Netflix", 19.0))
+        self.assertEqual(
+            tracker.apply("com.netflix.Netflix", True, event_at), "changed"
+        )
+        state.observe(payload, "dvt")
+        state.outage("dvt")
+
+        guard.ambiguous(19.5)
+        self.assertTrue(guard.accepts("com.netflix.Netflix", 20.0))
+        self.assertEqual(
+            tracker.apply(
+                "com.netflix.Netflix",
+                True,
+                event_at + timedelta(seconds=1),
+            ),
+            "same",
+        )
+        state.observe(state.payload, "dvt")
+
+        self.assertEqual(state.payload, payload)
+
+    def test_prolonged_dvt_ambiguity_uses_full_settle_guard(self) -> None:
+        guard = DvtSettleGuard(3.0, ambiguity_seconds=1.0)
+        self.assertTrue(guard.accepts("com.apple.HeadBoard", 20.0))
+        guard.ambiguous(20.5)
+        guard.ambiguous(21.6)
+
+        self.assertFalse(guard.accepts("com.netflix.Netflix", 21.7))
+        self.assertFalse(guard.accepts("com.netflix.Netflix", 24.699))
+        self.assertTrue(guard.accepts("com.netflix.Netflix", 24.7))
+
+    def test_stale_dvt_sample_cannot_open_ambiguity_grace(self) -> None:
+        guard = DvtSettleGuard(3.0, ambiguity_seconds=1.0)
+        self.assertTrue(guard.accepts("com.apple.HeadBoard", 30.0))
+        guard.ambiguous(31.001)
+
+        self.assertFalse(guard.accepts("com.netflix.Netflix", 31.1))
+
     def test_outage_preserves_retained_state_but_never_replays_it_online(self) -> None:
         state = ForegroundState()
         self.assertIsNone(state.replay_payload)
@@ -233,6 +304,22 @@ class ForegroundTrackerTest(unittest.TestCase):
             "com.apple.HeadBoard",
         )
         self.assertIsNone(_snapshot_foreground(infrastructure))
+        with self.assertRaises(TypeError):
+            _snapshot_foreground(None)
+        with self.assertRaises(TypeError):
+            _snapshot_foreground([*infrastructure, "malformed"])
+        with self.assertRaises(TypeError):
+            _snapshot_foreground(
+                [
+                    *infrastructure,
+                    process("com.netflix.Netflix"),
+                    {
+                        "bundleIdentifier": None,
+                        "isApplication": True,
+                        "foregroundRunning": True,
+                    },
+                ]
+            )
         self.assertIsNone(
             _snapshot_foreground(
                 [

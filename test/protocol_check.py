@@ -357,6 +357,7 @@ assert "rememberAppVolume(currentAppId, currentAppName" in activate_app
 assert activate_app.count("appVolumeLearningAllowed(") == 2
 maintain_app_switch = app_switch[app_switch.index("void maintainAppSwitch(") :]
 assert "restoreTargetRaw >= 0 && !restoreAutomatic" in maintain_app_switch
+assert "constexpr unsigned long kAppStableMs = 750;" in source
 assert "millis() - pendingAppAt >= kAppStableMs" in maintain_app_switch
 queue_app = app_switch[
     app_switch.index("void queueAppCandidate(") : app_switch.index(
@@ -505,9 +506,10 @@ assert "!restoreAutomaticMuteCycle && !automaticRemuteRequired" in observe_volum
 assert observe_volume.index("manualVolumeFeedbackMatches(") < observe_volume.index(
     "manualMuteLockClearsOnVolume("
 )
+learning_suppression_start = observe_volume.index("if (restoreLearningSuppressed)")
 pending_feedback_guard = observe_volume[
-    observe_volume.index("if (restoreLearningSuppressed)") : observe_volume.index(
-        "const bool cooldownElapsed"
+    learning_suppression_start : observe_volume.index(
+        "const unsigned long now = millis();", learning_suppression_start
     )
 ]
 assert "if (muteAutomaticFeedbackPending)" in pending_feedback_guard
@@ -531,6 +533,19 @@ assert muted_automatic_rejection.index("restoreLearningResumeAt = millis();") < 
 )
 assert "restoreTargetRaw = targetRaw;" not in muted_automatic_rejection
 assert "completeVolumeRestore" not in set_volume
+failed_restore = volume_restore[
+    volume_restore.index("void failVolumeRestore(") : volume_restore.index(
+        "void startRestoreForCurrentApp("
+    )
+]
+assert "restoreFailureRaw = -1;" in failed_restore
+learning_guard = observe_volume[
+    observe_volume.index("if (restoreLearningSuppressed)") : observe_volume.index(
+        "if (currentAppId.isEmpty()"
+    )
+]
+assert "learningFailureBaselineNeedsRefresh(" in learning_guard
+assert "kRestoreFailureCooldownMs" in learning_guard
 maintain_restore = volume_restore[
     volume_restore.index("void maintainVolumeRestore()") :
 ]

@@ -179,6 +179,40 @@ int main() {
   observeCancelledRestore(92);
   assert(!learningSuppressed && netflixRaw == 92);
 
+  int homeRaw = 100;
+  learningSuppressed = false;
+  blockedRaw = 110;
+  uint32_t learningQuietUntil = 0;
+  const auto failAutomaticRestore = [&]() {
+    learningSuppressed = true;
+    blockedRaw = -1;
+    learningQuietUntil = 2000;
+  };
+  failAutomaticRestore();
+  uint32_t learningNow = 2100;
+  const auto observeAfterFailedAutomaticRestore = [&](uint8_t raw) {
+    const bool quietElapsed = learningNow >= learningQuietUntil;
+    if (learningFailureBaselineNeedsRefresh(quietElapsed, blockedRaw, raw)) {
+      blockedRaw = raw;
+      const uint32_t quietUntil = learningNow + 2000;
+      if (quietUntil > learningQuietUntil) learningQuietUntil = quietUntil;
+      return;
+    }
+    if (!canResumeLearningAfterFailure(quietElapsed, blockedRaw, raw)) return;
+    learningSuppressed = false;
+    homeRaw = raw;
+  };
+  observeAfterFailedAutomaticRestore(108);
+  learningNow = 2501;
+  observeAfterFailedAutomaticRestore(109);
+  assert(learningSuppressed && blockedRaw == 109 && homeRaw == 100);
+  learningNow = 4501;
+  observeAfterFailedAutomaticRestore(109);
+  assert(learningSuppressed && homeRaw == 100);
+  learningNow = 4600;
+  observeAfterFailedAutomaticRestore(107);
+  assert(!learningSuppressed && homeRaw == 107);
+
   assert(!manualMuteLockClearsOnVolume(false, 72, 73, false));
   assert(!manualMuteLockClearsOnVolume(true, -1, 73, false));
   assert(!manualMuteLockClearsOnVolume(true, 72, 72, false));

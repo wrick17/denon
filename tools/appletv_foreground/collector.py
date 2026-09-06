@@ -49,6 +49,7 @@ _VALUE_TEMPLATE = (
 _RECONNECT_MAX_SECONDS = 30.0
 _RECONNECT_STABLE_SECONDS = 30.0
 _DVT_SETTLE_SECONDS = 3.0
+_DVT_AMBIGUITY_SECONDS = 1.0
 
 
 def _app_name(app_id: str) -> str:
@@ -197,12 +198,23 @@ class ForegroundState:
 
 
 def _snapshot_foreground(processes: Any) -> str | None:
-    if not isinstance(processes, list):
-        return None
+    if not isinstance(processes, list) or any(
+        not isinstance(process, dict) for process in processes
+    ):
+        raise TypeError("DVT process snapshot is malformed")
     for process in processes:
         if (
-            not isinstance(process, dict)
-            or process.get("foregroundRunning") is not True
+            process.get("isApplication") is True
+            and process.get("foregroundRunning") is True
+            and (
+                not isinstance(process.get("bundleIdentifier"), str)
+                or _APP_ID.fullmatch(process["bundleIdentifier"]) is None
+            )
+        ):
+            raise TypeError("DVT foreground app identity is malformed")
+    for process in processes:
+        if (
+            process.get("foregroundRunning") is not True
         ):
             continue
         real_app_name = process.get("realAppName")
@@ -218,8 +230,7 @@ def _snapshot_foreground(processes: Any) -> str | None:
     foreground = {
         process.get("bundleIdentifier")
         for process in processes
-        if isinstance(process, dict)
-        and process.get("isApplication") is True
+        if process.get("isApplication") is True
         and process.get("foregroundRunning") is True
         and isinstance(process.get("bundleIdentifier"), str)
         and _APP_ID.fullmatch(process["bundleIdentifier"]) is not None
@@ -247,20 +258,51 @@ def _source_is_authoritative(source: str, dvt_enabled: bool) -> bool:
 class DvtSettleGuard:
     """Hold the first stable app after an overlay clear or DVT outage."""
 
-    def __init__(self, seconds: float = _DVT_SETTLE_SECONDS) -> None:
+    def __init__(
+        self,
+        seconds: float = _DVT_SETTLE_SECONDS,
+        ambiguity_seconds: float = _DVT_AMBIGUITY_SECONDS,
+    ) -> None:
         self.seconds = seconds
+        self.ambiguity_seconds = ambiguity_seconds
         self.armed = False
         self.pending_app: str | None = None
         self.pending_since = 0.0
+        self.last_good_at: float | None = None
+        self.ambiguity_since: float | None = None
 
     def arm(self) -> None:
         self.armed = True
         self.pending_app = None
         self.pending_since = 0.0
+        self.ambiguity_since = None
+
+    def ambiguous(self, now: float) -> None:
+        if self.ambiguity_since is not None:
+            if now - self.ambiguity_since > self.ambiguity_seconds:
+                self.arm()
+            return
+        if (
+            not self.armed
+            and self.last_good_at is not None
+            and now - self.last_good_at <= self.ambiguity_seconds
+        ):
+            self.armed = True
+            self.ambiguity_since = now
+            return
+        self.arm()
 
     def accepts(self, app_id: str, now: float) -> bool:
         if not self.armed:
+            self.last_good_at = now
             return True
+        if self.ambiguity_since is not None:
+            if now - self.ambiguity_since <= self.ambiguity_seconds:
+                self.armed = False
+                self.ambiguity_since = None
+                self.last_good_at = now
+                return True
+            self.ambiguity_since = None
         if self.pending_app != app_id:
             self.pending_app = app_id
             self.pending_since = now
@@ -270,6 +312,7 @@ class DvtSettleGuard:
         self.armed = False
         self.pending_app = None
         self.pending_since = 0.0
+        self.last_good_at = now
         return True
 
 
@@ -588,10 +631,13 @@ def main() -> int:
     failure_count = 0
     dvt_stop = threading.Event()
 
-    def source_outage(source: str) -> None:
+    def source_outage(source: str, ambiguous_at: float | None = None) -> None:
         with foreground_state.lock:
             if source == "dvt":
-                dvt_settle.arm()
+                if ambiguous_at is None:
+                    dvt_settle.arm()
+                else:
+                    dvt_settle.ambiguous(ambiguous_at)
             was_online = foreground_state.online
             foreground_state.outage(source)
             if was_online and not foreground_state.online:
@@ -698,7 +744,7 @@ def main() -> int:
         if dvt_stop.is_set():
             return
         if app_id is None:
-            source_outage("dvt")
+            source_outage("dvt", time.monotonic())
             return
         accept_candidate(
             app_id,
