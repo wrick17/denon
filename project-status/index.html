@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="en" data-version="9">
+<html lang="en" data-version="12">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Live local status and system map for Apple TV per-app Denon volume control">
-  <title>Denon project map</title>
+  <title>Denon project status</title>
   <style>
     :root {
       color-scheme: dark;
@@ -49,7 +49,7 @@
     .glance-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
     .glance-list li { min-width: 0; color: var(--muted); font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }
 
-    .tasks { display: grid; gap: 14px; margin: 22px 0 28px; }
+    .tasks { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 22px 0 28px; }
     .task { background: rgba(15,20,28,.92); border: 1px solid var(--border); border-radius: 16px; padding: 17px; box-shadow: var(--shadow); }
     .task-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
     .status { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
@@ -77,6 +77,7 @@
     .edge-label-box { fill: rgba(8,11,16,.96); stroke: #405066; stroke-width: 1; }
     .edge-label { fill: var(--text); font-size: 10px; font-weight: 550; text-anchor: middle; dominant-baseline: middle; }
     .flow-grid { position: relative; z-index: 1; display: grid; grid-template-columns: repeat(6, minmax(130px, 1fr)); grid-template-rows: repeat(4, 115px); grid-template-areas: "apple tunnel collector mqtt . ." ". . . mqttconfig sensor relay" ". denon spp controller memory api" ". . . web . connectivity"; column-gap: clamp(24px, 3vw, 54px); row-gap: 70px; align-items: stretch; }
+    .mobile-edges { display: none; }
     .node { position: relative; width: 100%; min-height: 104px; text-align: left; color: var(--text); background: rgba(21,28,38,.98); border: 1px solid var(--border); border-radius: 13px; padding: 14px; cursor: pointer; box-shadow: 0 10px 26px rgba(0,0,0,.2); transition: transform .15s ease, border-color .15s ease, background .15s ease; }
     .node:hover, .node:focus-visible { transform: translateY(-2px); border-color: #50647d; background: #192331; outline: none; }
     .node.selected { border-color: var(--blue); box-shadow: 0 0 0 2px rgba(85,167,255,.16); }
@@ -117,14 +118,21 @@
       .map-shell { min-height: 980px; }
       .flow-grid { grid-template-columns: repeat(3, minmax(150px, 1fr)); grid-template-rows: repeat(5, 120px); grid-template-areas: "apple tunnel collector" "mqtt mqttconfig sensor" "relay api memory" "denon spp controller" "web connectivity ."; row-gap: 68px; }
       .below { grid-template-columns: 1fr; }
+      .tasks { grid-template-columns: 1fr; }
     }
     @media (max-width: 660px) {
       .shell { padding: 20px 12px 44px; }
       .topbar { flex-direction: column; }
       .live { padding-top: 0; }
+      .section-head { flex-direction: column; align-items: flex-start; gap: 6px; }
       .map-shell { padding: 14px; min-height: 0; }
-      .flow-grid { display: flex; flex-direction: column; gap: 10px; }
+      .flow-grid { display: flex; flex-direction: column; gap: 0; }
       #edges { display: none; }
+      .mobile-edges:not(:empty) { display: grid; gap: 7px; margin-left: 18px; padding: 8px 0 10px 18px; border-left: 1px dashed #52637a; }
+      .mobile-edge { position: relative; display: flex; align-items: center; gap: 8px; min-width: 0; }
+      .mobile-edge::before { content: ""; position: absolute; left: -18px; width: 13px; border-top: 1px dashed #52637a; }
+      .mobile-edge-label { min-width: 0; padding: 4px 8px; color: var(--text); background: rgba(8,11,16,.96); border: 1px solid #405066; border-radius: 7px; font-size: 10px; font-weight: 550; overflow-wrap: anywhere; }
+      .mobile-edge-target { min-width: 0; color: var(--muted); font-size: 10px; line-height: 1.3; overflow-wrap: anywhere; }
       .task-head { align-items: flex-start; }
       .task-item { grid-template-columns: 1fr; gap: 4px; }
     }
@@ -137,8 +145,8 @@
   <main class="shell">
     <header class="topbar">
       <div>
-        <div class="eyebrow">Live local project map</div>
-        <h1 id="project-name">Denon project map</h1>
+        <div class="eyebrow">Current project status</div>
+        <h1 id="project-name">Denon project status</h1>
         <p class="summary" id="project-summary">Loading current project state…</p>
       </div>
       <div class="live" aria-live="polite">
@@ -151,15 +159,15 @@
       <h2 id="glance-title">At a glance</h2>
       <div class="glance-grid">
         <section class="glance-card now"><h3>Happening now</h3><ul class="glance-list" id="glance-now"></ul></section>
-        <section class="glance-card waiting"><h3>Still pending or blocked</h3><ul class="glance-list" id="glance-waiting"></ul></section>
-        <section class="glance-card finished"><h3>Already completed</h3><ul class="glance-list" id="glance-finished"></ul></section>
+        <section class="glance-card waiting"><h3>Remaining</h3><ul class="glance-list" id="glance-waiting"></ul></section>
+        <section class="glance-card finished"><h3>Verified working</h3><ul class="glance-list" id="glance-finished"></ul></section>
       </div>
     </section>
 
     <section aria-labelledby="map-title">
       <div class="section-head">
         <h2 id="map-title">End-to-end system flow</h2>
-        <p>Arrows show runtime direction. The lower return path is measured volume feedback.</p>
+        <p>Connections follow runtime direction. Boxed labels name each handoff, including measured volume feedback.</p>
       </div>
       <div class="map-shell" id="map-shell">
         <svg id="edges" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/></marker></defs></svg>
@@ -169,8 +177,8 @@
 
     <section aria-labelledby="tasks-title">
       <div class="section-head">
-        <h2 id="tasks-title">Workstreams</h2>
-        <p>Each workstream keeps every item in one labeled list.</p>
+        <h2 id="tasks-title">Project history and current work</h2>
+        <p>Completed phases, current work and deferred checks.</p>
       </div>
       <div class="tasks" id="tasks"></div>
     </section>
@@ -240,12 +248,20 @@
 
     function renderMap() {
       const target = document.getElementById("flow-grid");
+      const nodeNames = new Map(state.nodes.map(node => [node.id, node.name]));
       target.innerHTML = state.nodes.map(node => `
           <button class="node${selected === node.id ? " selected" : ""}" type="button" data-node="${esc(node.id)}">
             <div class="node-top"><h3>${esc(node.name)}</h3><span class="${statusClass(node.status)}">${statusLabel(node.status)}</span></div>
             <div class="node-kind">${esc(node.kind)}</div>
             <div class="node-location">${esc(node.location)}</div>
-          </button>`).join("");
+          </button>
+          <div class="mobile-edges" aria-label="Connections from ${esc(node.name)}">
+            ${state.edges.filter(edge => edge.from === node.id).map(edge => `
+              <div class="mobile-edge ${esc(edge.status)}">
+                <span class="mobile-edge-label">${esc(edge.label)}</span>
+                <span class="mobile-edge-target">to ${esc(nodeNames.get(edge.to) || edge.to)}</span>
+              </div>`).join("")}
+          </div>`).join("");
       document.querySelectorAll("[data-node]").forEach(button => button.addEventListener("click", () => selectNode(button.dataset.node)));
       requestAnimationFrame(drawEdges);
     }
