@@ -470,13 +470,13 @@
     },
     {
       "time": "07:14",
-      "status": "active",
-      "text": "No clear user-observed latency improvement over phase 1 is accepted yet. Screensaver, rapid-transition and original-adapter checks remain pending."
+      "status": "done",
+      "text": "Historical checkpoint, superseded by final acceptance: No clear user-observed latency improvement over phase 1 is accepted yet. Screensaver, rapid-transition and original-adapter checks remain pending."
     },
     {
       "time": "07:07",
-      "status": "active",
-      "text": "UART and passive MQTT acceptance capture is active. Faster switching, phone Web UI stability and screensaver behavior remain physically unaccepted."
+      "status": "done",
+      "text": "Historical checkpoint, superseded by final acceptance: UART and passive MQTT acceptance capture is active. Faster switching, phone Web UI stability and screensaver behavior remain physically unaccepted."
     },
     {
       "time": "07:06",
@@ -485,8 +485,8 @@
     },
     {
       "time": "06:49",
-      "status": "active",
-      "text": "A phone-WebUI-open Netflix switch completed on unchanged live firmware under Mac USB power and physically reached 61.0. UART logged WiFiClient EAGAIN, but there was no panic, watchdog reset or network loss. The earlier deployed disappearance remains unresolved and intermittent."
+      "status": "done",
+      "text": "Historical checkpoint, superseded by final acceptance: A phone-WebUI-open Netflix switch completed on unchanged live firmware under Mac USB power and physically reached 61.0. UART logged WiFiClient EAGAIN, but there was no panic, watchdog reset or network loss. The earlier deployed disappearance remains unresolved and intermittent."
     },
     {
       "time": "06:49",
@@ -495,13 +495,13 @@
     },
     {
       "time": "06:50",
-      "status": "pending",
-      "text": "Home was accidentally learned at 54.0. Restore it to the expected 50.0 through ordinary manual learning after the firmware fix."
+      "status": "done",
+      "text": "Historical checkpoint, superseded by final acceptance: Home was accidentally learned at 54.0. Restore it to the expected 50.0 through ordinary manual learning after the firmware fix."
     },
     {
       "time": "06:23",
-      "status": "active",
-      "text": "The phone Web UI failure reproduced with normal Home Assistant traffic and no ESP developer polling. Netflix was detected promptly, then the HA backup and app POST timed out; Home Assistant reported no route to host, ARP was incomplete and Mac TCP also timed out. The phone page still showed Connected and 60.0, which may have been cached or stale. Cause remains open."
+      "status": "done",
+      "text": "Historical checkpoint, superseded by final acceptance: The phone Web UI failure reproduced with normal Home Assistant traffic and no ESP developer polling. Netflix was detected promptly, then the HA backup and app POST timed out; Home Assistant reported no route to host, ARP was incomplete and Mac TCP also timed out. The phone page still showed Connected and 60.0, which may have been cached or stale. Cause remains open."
     },
     {
       "time": "06:23",
@@ -515,8 +515,8 @@
     },
     {
       "time": "06:08",
-      "status": "active",
-      "text": "Full phase 1 physical acceptance remains open. This trial had no offline or ambiguity event, so it did not exercise the shortened branch; repeat, reverse and screensaver checks are next."
+      "status": "done",
+      "text": "Historical checkpoint, superseded by final acceptance: Full phase 1 physical acceptance remains open. This trial had no offline or ambiguity event, so it did not exercise the shortened branch; repeat, reverse and screensaver checks are next."
     },
     {
       "time": "06:06",
@@ -525,13 +525,8 @@
     },
     {
       "time": "06:30",
-      "status": "pending",
-      "text": "Phase 2 will first reproduce the reported phone Web UI automation stop. Its cause is not confirmed. Any fix and residual debounce tuning will share one reviewed firmware flash."
-    },
-    {
-      "time": "06:30",
-      "status": "pending",
-      "text": "Final reporting is waiting for the user's explicit finalize instruction."
+      "status": "done",
+      "text": "Historical checkpoint, superseded by final acceptance: Phase 2 will first reproduce the reported phone Web UI automation stop. Its cause is not confirmed. Any fix and residual debounce tuning will share one reviewed firmware flash."
     },
     {
       "time": "05:54",
