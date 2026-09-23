@@ -140,6 +140,10 @@ bool pendingRestoreAllowed = true;
 bool currentPlaybackIdleAuthorized = false;
 unsigned long currentPlaybackAt = 0;
 char lastPlaybackIdleEventId[33] = {};
+char reconnectRestoreEventId[33] = {};
+char reconnectRestoreAppId[kMaxAppIdLength + 1] = {};
+int reconnectRestoreTargetRaw = -1;
+int pendingReconnectTargetRaw = -1;
 unsigned long apiClaimUntil = 0;
 bool wifiWasConnected = false;
 bool staticNetworkEnabled = false;
@@ -722,6 +726,39 @@ void copyText(char *destination, size_t capacity, const String &value) {
   destination[length] = '\0';
 }
 
+void clearReconnectRestore() {
+  reconnectRestoreEventId[0] = '\0';
+  reconnectRestoreAppId[0] = '\0';
+  reconnectRestoreTargetRaw = -1;
+}
+
+void invalidateReconnectRestore() {
+  const bool pendingCredit = pendingReconnectTargetRaw >= 0;
+  clearReconnectRestore();
+  pendingReconnectTargetRaw = -1;
+  if (pendingCredit) {
+    pendingRestoreAllowed = false;
+    pendingPlaybackIdleAuthorized = false;
+  }
+}
+
+bool reconnectRestoreMatches(const String &appId, const String &eventId) {
+  return reconnectRestoreTargetRaw >= 0 &&
+         appId == reconnectRestoreAppId && eventId == reconnectRestoreEventId;
+}
+
+void rememberReconnectRestore(const String &appId, const char *eventId,
+                              int targetRaw) {
+  if (targetRaw < 0 ||
+      !validPlaybackEventId(eventId, strlen(eventId))) {
+    return;
+  }
+  copyText(reconnectRestoreAppId, sizeof(reconnectRestoreAppId), appId);
+  copyText(reconnectRestoreEventId, sizeof(reconnectRestoreEventId),
+           String(eventId));
+  reconnectRestoreTargetRaw = targetRaw;
+}
+
 void loadAppVolumes() {
   activeAppBank = preferences.getUChar("app_bank", 0);
   if (activeAppBank > 1) {
@@ -1026,10 +1063,12 @@ void startRestoreForCurrentApp() {
 }
 
 void clearCurrentApp() {
+  invalidateReconnectRestore();
   pendingAppId = "";
   pendingAppName = "";
   pendingPlaybackIdleAuthorized = false;
   pendingRestoreAllowed = true;
+  pendingReconnectTargetRaw = -1;
   currentAppId = "";
   currentAppName = "";
   currentPlaybackIdleAuthorized = false;
@@ -1039,7 +1078,8 @@ void clearCurrentApp() {
 }
 
 void queueAppCandidate(String appId, String appName, bool playbackKnown,
-                       bool playbackActive, String eventId) {
+                       bool playbackActive, String eventId,
+                       bool reauthorizeAfterLinkLoss) {
   appId.trim();
   appName.trim();
   if (isIgnoredAppId(appId)) return;
@@ -1047,11 +1087,24 @@ void queueAppCandidate(String appId, String appName, bool playbackKnown,
   const bool validIdleEvent =
       playbackKnown && !playbackActive &&
       validPlaybackEventId(eventId.c_str(), eventId.length());
-  const bool idleAuthorized = playbackIdleEventGrants(
-      playbackKnown, playbackActive, eventId.c_str(), eventId.length(),
-      lastPlaybackIdleEventId);
+  if (pendingReconnectTargetRaw >= 0) invalidateReconnectRestore();
+  const bool reconnectIdentityMatches =
+      validIdleEvent && reconnectRestoreMatches(appId, eventId);
+  if (reconnectRestoreTargetRaw >= 0 && !reconnectIdentityMatches) {
+    invalidateReconnectRestore();
+  }
+  const bool reconnectAuthorized =
+      reauthorizeAfterLinkLoss && reconnectIdentityMatches;
+  const bool idleAuthorized =
+      reconnectAuthorized ||
+      (!reauthorizeAfterLinkLoss &&
+       playbackIdleEventGrants(playbackKnown, playbackActive,
+                               eventId.c_str(), eventId.length(),
+                               lastPlaybackIdleEventId));
   const bool duplicateIdleEvent = validIdleEvent && !idleAuthorized;
-  if (idleAuthorized) {
+  const bool restoreAuthorized =
+      idleAuthorized || (playbackKnown && playbackActive);
+  if (idleAuthorized && !reconnectAuthorized) {
     copyText(lastPlaybackIdleEventId, sizeof(lastPlaybackIdleEventId), eventId);
   }
   if (appName.isEmpty()) appName = appId;
@@ -1064,6 +1117,7 @@ void queueAppCandidate(String appId, String appName, bool playbackKnown,
     pendingAppId = "";
     pendingAppName = "";
     pendingRestoreAllowed = true;
+    pendingReconnectTargetRaw = -1;
     currentAppName = appName;
     if (!duplicateIdleEvent) {
       currentPlaybackIdleAuthorized = idleAuthorized;
@@ -1077,7 +1131,11 @@ void queueAppCandidate(String appId, String appName, bool playbackKnown,
                appName);
       markAppDirty(static_cast<size_t>(index), false);
     }
-    if (!duplicateIdleEvent && (hadPendingSwitch || idleAuthorized)) {
+    if (reconnectAuthorized) {
+      const int retryTargetRaw = reconnectRestoreTargetRaw;
+      clearReconnectRestore();
+      setVolume(retryTargetRaw, true);
+    } else if (!duplicateIdleEvent && (hadPendingSwitch || idleAuthorized)) {
       startRestoreForCurrentApp();
     }
     return;
@@ -1088,6 +1146,13 @@ void queueAppCandidate(String appId, String appName, bool playbackKnown,
     if (!duplicateIdleEvent) {
       pendingPlaybackIdleAuthorized = idleAuthorized;
       pendingPlaybackAt = now;
+      pendingRestoreAllowed = restoreAuthorized;
+      if (reconnectAuthorized) {
+        pendingReconnectTargetRaw = reconnectRestoreTargetRaw;
+        clearReconnectRestore();
+      } else {
+        pendingReconnectTargetRaw = -1;
+      }
     }
     return;
   }
@@ -1105,7 +1170,13 @@ void queueAppCandidate(String appId, String appName, bool playbackKnown,
   pendingAppName = appName;
   pendingPlaybackIdleAuthorized = idleAuthorized;
   pendingPlaybackAt = now;
-  pendingRestoreAllowed = !duplicateIdleEvent;
+  pendingRestoreAllowed = restoreAuthorized;
+  if (reconnectAuthorized) {
+    pendingReconnectTargetRaw = reconnectRestoreTargetRaw;
+    clearReconnectRestore();
+  } else {
+    pendingReconnectTargetRaw = -1;
+  }
   pendingAppAt = now;
 }
 
@@ -1127,7 +1198,9 @@ void activatePendingApp() {
   pendingAppName = "";
   pendingPlaybackIdleAuthorized = false;
   const bool restoreAllowed = pendingRestoreAllowed;
+  const int retryTargetRaw = pendingReconnectTargetRaw;
   pendingRestoreAllowed = true;
+  pendingReconnectTargetRaw = -1;
 
   const int existing = findApp(currentAppId);
   if (existing >= 0) {
@@ -1137,7 +1210,13 @@ void activatePendingApp() {
                sizeof(appVolumes[existing].appName), currentAppName);
       markAppDirty(static_cast<size_t>(existing), false);
     }
-    if (restoreAllowed) startRestoreForCurrentApp();
+    if (restoreAllowed) {
+      if (retryTargetRaw >= 0) {
+        setVolume(retryTargetRaw, true);
+      } else {
+        startRestoreForCurrentApp();
+      }
+    }
   } else if (appVolumeLearningAllowed(
                  restoreTargetRaw, restoreLearningSuppressed, volumeRaw,
                  muteStateKnown, denonMuted, manualMuteLocked)) {
@@ -1170,6 +1249,7 @@ void observeMute(bool muted) {
       !muted || !activeTargetCommand || automaticRemuteRequired ||
       armAutomaticRemuteRecovery(millis());
   const bool becameMuted = !muteStateKnown || !denonMuted;
+  const bool becameUnmuted = muteStateKnown && denonMuted && !muted;
   muteStateKnown = true;
   denonMuted = muted;
   if (!muted) {
@@ -1177,6 +1257,7 @@ void observeMute(bool muted) {
       if (restoreAutomaticMuteCycle) restoreAutomaticUnmuteObserved = true;
       return;
     }
+    if (becameUnmuted) invalidateReconnectRestore();
     clearManualMuteLock();
     return;
   }
@@ -1191,6 +1272,7 @@ void observeMute(bool muted) {
     return;
   }
   if (!becameMuted) return;
+  invalidateReconnectRestore();
 
   const bool cancelTarget =
       restoreTargetRaw >= 0 &&
@@ -1277,6 +1359,13 @@ void observeVolume(uint8_t raw) {
   if (restoreTargetRaw >= 0) {
     const unsigned long now = millis();
     const int previousRaw = restoreObservedRaw;
+    if (restoreAutomatic && restoreSteps > 0 && restoreCommandDirection != 0 &&
+        previousRaw >= 0 && raw != previousRaw &&
+        !volumeMovementInDirection(previousRaw, raw,
+                                   restoreCommandDirection)) {
+      failVolumeRestore("wrong_direction");
+      return;
+    }
     if (!validateActiveBurstFeedback(raw)) return;
     if (restorePhase == VolumeTargetPhase::waitFreshStatus) {
       restoreObservedRaw = raw;
@@ -1306,12 +1395,12 @@ void observeVolume(uint8_t raw) {
       restoreObservedRaw = raw;
       restoreLastChangedAt = now;
       if (restoreBurstActive) {
-        restoreBurstActive = false;
         restoreBurstExtensionPending = volumeRapidExtensionAllowed(
             raw, restoreTargetRaw, restoreCommandDirection,
             automaticRestoreCommandAllowed(),
             timeReached(now, restoreDeadlineAt), restoreSteps,
             kRestoreMaxSteps);
+        restoreBurstActive = !restoreBurstExtensionPending;
         restorePhase = restoreBurstExtensionPending
                            ? VolumeTargetPhase::waitBurstSecond
                            : VolumeTargetPhase::settling;
@@ -1322,6 +1411,18 @@ void observeVolume(uint8_t raw) {
     }
     if (restorePhase == VolumeTargetPhase::waitBurstSecond) {
       if (raw == restoreObservedRaw) return;
+      if (restoreBurstExtensionPending &&
+          !volumeRapidFeedbackValid(
+              restoreBurstStartRaw, restoreObservedRaw, raw,
+              restoreCommandDirection, restoreBurstClicksSent)) {
+        const char *reason =
+            volumeMovementInDirection(restoreObservedRaw, raw,
+                                      restoreCommandDirection)
+                ? "rapid_gain_exceeded"
+                : "wrong_direction";
+        failVolumeRestore(reason);
+        return;
+      }
       const bool continuedInDirection = volumeMovementInDirection(
           restoreObservedRaw, raw, restoreCommandDirection);
       restoreObservedRaw = raw;
@@ -1334,6 +1435,7 @@ void observeVolume(uint8_t raw) {
                 timeReached(now, restoreDeadlineAt), restoreSteps,
                 kRestoreMaxSteps)) {
           restoreBurstExtensionPending = false;
+          restoreBurstActive = true;
           restorePhase = VolumeTargetPhase::settling;
         }
         return;
@@ -1411,6 +1513,7 @@ void observeVolume(uint8_t raw) {
                                        raw)) {
       return;
     }
+    invalidateReconnectRestore();
     restoreLearningSuppressed = false;
     restoreFailureRaw = -1;
     restoreLearningResumeAt = 0;
@@ -1926,15 +2029,34 @@ void maintainDenon() {
   }
 
   if (wasDenonConnected) {
+    const bool quarantineAutomaticFeedback = restoreAutomatic;
+    if (restoreAutomatic && currentPlaybackIdleAuthorized) {
+      rememberReconnectRestore(currentAppId, lastPlaybackIdleEventId,
+                               restoreTargetRaw);
+    } else if (!pendingAppId.isEmpty() && pendingRestoreAllowed &&
+               pendingPlaybackIdleAuthorized) {
+      const int pendingIndex = findApp(pendingAppId);
+      if (pendingIndex >= 0) {
+        rememberReconnectRestore(pendingAppId, lastPlaybackIdleEventId,
+                                 appVolumes[pendingIndex].raw);
+      }
+    }
     wasDenonConnected = false;
     sessionInitialized = false;
     volumeRaw = -1;
     muteStateKnown = false;
     currentPlaybackIdleAuthorized = false;
     pendingPlaybackIdleAuthorized = false;
-    if (restoreAutomaticMuteCycle || automaticRemuteRequired) {
+    pendingRestoreAllowed = false;
+    pendingReconnectTargetRaw = -1;
+    if (restoreAutomatic || automaticRemuteRequired) {
       automaticMuteConfirmationPending = false;
       cancelVolumeRestore();
+      if (quarantineAutomaticFeedback) {
+        restoreLearningSuppressed = true;
+        restoreFailureRaw = -1;
+        restoreLearningResumeAt = now + kVolumeStepResponseTimeoutMs;
+      }
     } else {
       pauseVolumeTargetSession();
     }
@@ -2099,12 +2221,13 @@ bool parseJsonString(const String &json, size_t &position, String &output) {
 
 bool parseAppJson(const String &json, String &appId, String &appName,
                   String &eventId, bool &playbackKnown,
-                  bool &playbackActive) {
+                  bool &playbackActive, bool &reauthorizeAfterLinkLoss) {
   size_t position = 0;
   bool hasAppId = false;
   bool hasAppName = false;
   playbackKnown = false;
   playbackActive = false;
+  reauthorizeAfterLinkLoss = false;
   eventId = "";
   skipJsonWhitespace(json, position);
   if (position >= json.length() || json[position++] != '{') return false;
@@ -2115,17 +2238,23 @@ bool parseAppJson(const String &json, String &appId, String &appName,
     skipJsonWhitespace(json, position);
     if (position >= json.length() || json[position++] != ':') return false;
     skipJsonWhitespace(json, position);
-    if (key == "playback_active") {
+    if (key == "playback_active" ||
+        key == "reauthorize_after_link_loss") {
+      bool value = false;
       if (json.substring(position, position + 4) == "true") {
-        playbackActive = true;
+        value = true;
         position += 4;
       } else if (json.substring(position, position + 5) == "false") {
-        playbackActive = false;
         position += 5;
       } else {
         return false;
       }
-      playbackKnown = true;
+      if (key == "playback_active") {
+        playbackActive = value;
+        playbackKnown = true;
+      } else {
+        reauthorizeAfterLinkLoss = value;
+      }
     } else {
       String value;
       if (!parseJsonString(json, position, value)) return false;
@@ -2307,18 +2436,22 @@ bool jsonSelfCheck() {
   String eventId;
   bool playbackKnown = false;
   bool playbackActive = false;
+  bool reauthorizeAfterLinkLoss = false;
   StoredAppVolume apps[kMaxApps];
   size_t count = 0;
   return parseAppJson(
              "{\"app_id\":\"com.example.video\",\"app_name\":\"Video\","
              "\"event_id\":\"0123456789abcdef0123456789abcdef\","
-             "\"playback_active\":false}",
-             appId, appName, eventId, playbackKnown, playbackActive) &&
+             "\"playback_active\":false,"
+             "\"reauthorize_after_link_loss\":true}",
+             appId, appName, eventId, playbackKnown, playbackActive,
+             reauthorizeAfterLinkLoss) &&
          appId == "com.example.video" && appName == "Video" &&
          eventId == "0123456789abcdef0123456789abcdef" && playbackKnown &&
-         !playbackActive &&
+         !playbackActive && reauthorizeAfterLinkLoss &&
          !parseAppJson("{\"app_id\":\"bad\",}", appId, appName,
-                       eventId, playbackKnown, playbackActive) &&
+                       eventId, playbackKnown, playbackActive,
+                       reauthorizeAfterLinkLoss) &&
          parseBackupJson(
              "{\"schema\":1,\"apps\":[{\"app_id\":\"one\","
              "\"app_name\":\"One\",\"volume_raw\":100},{\"app_id\":"
@@ -2578,8 +2711,10 @@ void receiveApp() {
   String eventId;
   bool playbackKnown = false;
   bool playbackActive = false;
+  bool reauthorizeAfterLinkLoss = false;
   if (!parseAppJson(server.arg("plain"), appId, appName, eventId,
-                    playbackKnown, playbackActive)) {
+                    playbackKnown, playbackActive,
+                    reauthorizeAfterLinkLoss)) {
     server.send(400, "text/plain",
                 "Expected JSON string fields app_id and app_name");
     return;
@@ -2597,6 +2732,7 @@ void receiveApp() {
     return;
   }
   if (isIgnoredAppId(appId)) {
+    invalidateReconnectRestore();
     server.send(204);
     return;
   }
@@ -2609,10 +2745,15 @@ void receiveApp() {
           serialBt.connected(), sessionInitialized, volumeRaw, muteStateKnown,
           denonMuted, manualMuteLocked, automaticRemuteRequired,
           manualTargetActive)) {
+    if (reconnectRestoreTargetRaw >= 0 &&
+        !reconnectRestoreMatches(appId, eventId)) {
+      invalidateReconnectRestore();
+    }
     server.send(503, "text/plain", "Receiver state is not ready for this event");
     return;
   }
-  queueAppCandidate(appId, appName, playbackKnown, playbackActive, eventId);
+  queueAppCandidate(appId, appName, playbackKnown, playbackActive, eventId,
+                    reauthorizeAfterLinkLoss);
   server.send(202, "application/json", "{\"accepted\":true}");
 }
 
@@ -2729,6 +2870,7 @@ void sendVolume(const uint8_t *command, size_t length, int direction) {
     server.send(503, "text/plain", "Receiver is not connected");
     return;
   }
+  invalidateReconnectRestore();
   acceptManualVolumeFeedback(direction);
   cancelVolumeRestore();
   nextStatusAt = millis() + 300;
@@ -2764,6 +2906,7 @@ void sendTargetVolume() {
     server.send(400, "text/plain", "Volume is out of range");
     return;
   }
+  invalidateReconnectRestore();
   server.send(202, "application/json",
               "{\"accepted\":true,\"target_volume\":" +
                   String(targetRaw / 2.0f, 1) + ",\"target_id\":" +

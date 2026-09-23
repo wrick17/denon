@@ -130,6 +130,28 @@ int main() {
   assert(!observeRapid(109));
   assert(rapidFailed && rapidObservedRaw == 100);
 
+  int automaticSends = 0;
+  const auto bufferedBurstContradiction = [&](int previousRaw, int raw) {
+    const bool valid = volumeRapidFeedbackValid(100, previousRaw, raw, 1, 2);
+    if (valid) ++automaticSends;
+    return valid;
+  };
+  assert(!bufferedBurstContradiction(106, 105));
+  assert(automaticSends == 0);
+  assert(!bufferedBurstContradiction(106, 111));
+  assert(automaticSends == 0);
+  assert(bufferedBurstContradiction(106, 110));
+  assert(automaticSends == 1);
+  const auto automaticFeedbackContradicts = [](int previousRaw, int raw,
+                                                int direction) {
+    return raw != previousRaw &&
+           !volumeMovementInDirection(previousRaw, raw, direction);
+  };
+  assert(automaticFeedbackContradicts(106, 105, 1));
+  assert(!automaticFeedbackContradicts(106, 107, 1));
+  assert(automaticFeedbackContradicts(94, 95, -1));
+  assert(!automaticFeedbackContradicts(94, 93, -1));
+
   int spotifyRaw = 90;
   int netflixRaw = 120;
   bool learningSuppressed = true;
@@ -178,6 +200,28 @@ int main() {
   assert(learningSuppressed && netflixRaw == 120);
   observeCancelledRestore(92);
   assert(!learningSuppressed && netflixRaw == 92);
+
+  netflixRaw = 120;
+  learningSuppressed = true;
+  blockedRaw = -1;
+  bool disconnectCooldownElapsed = false;
+  const auto observeAfterAutomaticDisconnect = [&](uint8_t raw) {
+    if (!disconnectCooldownElapsed) return;
+    if (blockedRaw < 0) {
+      blockedRaw = raw;
+      return;
+    }
+    if (!canResumeLearningAfterFailure(true, blockedRaw, raw)) return;
+    learningSuppressed = false;
+    netflixRaw = raw;
+  };
+  observeAfterAutomaticDisconnect(106);
+  assert(learningSuppressed && blockedRaw < 0 && netflixRaw == 120);
+  disconnectCooldownElapsed = true;
+  observeAfterAutomaticDisconnect(106);
+  assert(learningSuppressed && blockedRaw == 106 && netflixRaw == 120);
+  observeAfterAutomaticDisconnect(107);
+  assert(!learningSuppressed && netflixRaw == 107);
 
   int homeRaw = 100;
   learningSuppressed = false;
@@ -246,6 +290,47 @@ int main() {
   assert(playbackIdleEventGrants(true, false, nextEvent, 32, firstEvent));
   assert(!playbackIdleEventGrants(true, false, "", 0, firstEvent));
   assert(!playbackIdleEventGrants(true, true, nextEvent, 32, firstEvent));
+  bool reconnectMarker = true;
+  const auto reauthorizeAfterLinkLoss = [&](bool explicitReplay,
+                                             bool exactIdentity) {
+    if (!explicitReplay || !exactIdentity || !reconnectMarker) return false;
+    reconnectMarker = false;
+    return true;
+  };
+  assert(!reauthorizeAfterLinkLoss(false, true));
+  assert(reconnectMarker);
+  assert(!reauthorizeAfterLinkLoss(true, false));
+  assert(reconnectMarker);
+  assert(reauthorizeAfterLinkLoss(true, true));
+  assert(!reconnectMarker);
+  assert(!reauthorizeAfterLinkLoss(true, true));
+  bool pendingReconnectCredit = true;
+  bool pendingRestoreAllowed = true;
+  int pendingAutomaticStarts = 0;
+  const auto invalidatePendingReconnect = [&]() {
+    if (!pendingReconnectCredit) return;
+    pendingReconnectCredit = false;
+    pendingRestoreAllowed = false;
+  };
+  const auto activatePendingReconnect = [&]() {
+    if (pendingRestoreAllowed) ++pendingAutomaticStarts;
+  };
+  invalidatePendingReconnect();
+  const bool omittedPlaybackKnown = false;
+  const bool omittedPlaybackActive = false;
+  const bool omittedIdleAuthorized = false;
+  pendingRestoreAllowed =
+      omittedIdleAuthorized ||
+      (omittedPlaybackKnown && omittedPlaybackActive);
+  activatePendingReconnect();
+  assert(!pendingReconnectCredit && !pendingRestoreAllowed &&
+         pendingAutomaticStarts == 0);
+  const bool activePlaybackKnown = true;
+  const bool activePlayback = true;
+  pendingRestoreAllowed =
+      omittedIdleAuthorized || (activePlaybackKnown && activePlayback);
+  activatePendingReconnect();
+  assert(pendingAutomaticStarts == 1);
   assert(!playbackIdleEventReady(false, true, 90, true, true, true, false,
                                 false));
   assert(!playbackIdleEventReady(true, false, 90, true, true, true, false,

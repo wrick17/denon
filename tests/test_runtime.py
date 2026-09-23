@@ -491,13 +491,18 @@ async def test_same_app_playback_start_revokes_safe_permission(
     ]
 
 
-async def test_heartbeat_does_not_renew_foreground_permission() -> None:
-    """Only a fresh foreground event grants the short mute-restore lease."""
+async def test_heartbeat_replays_same_foreground_event() -> None:
+    """A heartbeat can reissue one firmware-idempotent foreground event."""
+    event_id = "1" * 32
     states = {
         FOREGROUND_ENTITY_ID: State(
             FOREGROUND_ENTITY_ID,
             "Netflix",
-            {"app_id": "com.netflix.Netflix", "app_name": "Netflix"},
+            {
+                "app_id": "com.netflix.Netflix",
+                "app_name": "Netflix",
+                "event_id": event_id,
+            },
         ),
         APPLE_TV_ENTITY_ID: State(
             APPLE_TV_ENTITY_ID,
@@ -529,8 +534,88 @@ async def test_heartbeat_does_not_renew_foreground_permission() -> None:
 
     assert [call.kwargs["playback_active"] for call in send.await_args_list] == [
         False,
+        False,
+    ]
+    assert [call.kwargs["event_id"] for call in send.await_args_list] == [
+        event_id,
+        event_id,
+    ]
+    assert "reauthorize_after_link_loss" not in send.await_args_list[0].kwargs
+    assert send.await_args_list[1].kwargs["reauthorize_after_link_loss"] is True
+
+
+@pytest.mark.parametrize(
+    ("playback_state", "attributes", "expected_revoke"),
+    [
+        (
+            "playing",
+            {"app_id": "com.netflix.Netflix", "app_name": "Netflix"},
+            True,
+        ),
+        (STATE_OFF, {}, None),
+        (STATE_UNAVAILABLE, {}, None),
+        (STATE_UNKNOWN, {}, None),
+    ],
+)
+async def test_heartbeat_replay_stops_after_playback_revocation(
+    playback_state: str,
+    attributes: dict[str, str],
+    expected_revoke: bool | None,
+) -> None:
+    """Playback changes revoke a heartbeat replay until a new foreground event."""
+    event_id = "1" * 32
+    states = {
+        FOREGROUND_ENTITY_ID: State(
+            FOREGROUND_ENTITY_ID,
+            "Netflix",
+            {
+                "app_id": "com.netflix.Netflix",
+                "app_name": "Netflix",
+                "event_id": event_id,
+            },
+        ),
+        APPLE_TV_ENTITY_ID: State(APPLE_TV_ENTITY_ID, STATE_IDLE, {}),
+    }
+    hass = SimpleNamespace(states=SimpleNamespace(get=states.get))
+    entry = SimpleNamespace(
+        data={
+            CONF_ENTITY_ID: FOREGROUND_ENTITY_ID,
+            CONF_HOST: "denon-volume.local",
+            CONF_PORT: 80,
+            CONF_TOKEN: "e" * 64,
+        }
+    )
+
+    with patch(
+        "custom_components.denon_app_volume.async_get_clientsession",
+        return_value=object(),
+    ):
+        relay = AppRelay(hass, entry, playback_entity_id=APPLE_TV_ENTITY_ID)
+
+    with patch(
+        "custom_components.denon_app_volume.async_send_app", new_callable=AsyncMock
+    ) as send:
+        await relay._async_send_current(force=False, fresh_foreground=True)
+        await relay._async_send_current(force=True, fresh_foreground=False)
+        states[APPLE_TV_ENTITY_ID] = State(
+            APPLE_TV_ENTITY_ID, playback_state, attributes
+        )
+        await relay._async_send_current(force=False, fresh_foreground=False)
+        states[APPLE_TV_ENTITY_ID] = State(APPLE_TV_ENTITY_ID, STATE_IDLE, {})
+        await relay._async_send_current(force=True, fresh_foreground=False)
+
+    assert [call.kwargs["playback_active"] for call in send.await_args_list] == [
+        False,
+        False,
+        expected_revoke,
         None,
     ]
+    assert "reauthorize_after_link_loss" not in send.await_args_list[0].kwargs
+    assert send.await_args_list[1].kwargs["reauthorize_after_link_loss"] is True
+    assert all(
+        "reauthorize_after_link_loss" not in call.kwargs
+        for call in send.await_args_list[2:]
+    )
 
 
 async def test_failed_foreground_delivery_retries_same_event() -> None:
@@ -1153,11 +1238,32 @@ async def test_app_handoff_carries_only_known_playback_safety() -> None:
         "com.netflix.Netflix",
         "Netflix",
         playback_active=False,
+        event_id="1" * 32,
     )
     assert session.post.call_args.kwargs["json"] == {
         "app_id": "com.netflix.Netflix",
         "app_name": "Netflix",
         "playback_active": False,
+        "event_id": "1" * 32,
+    }
+
+    await async_send_app(
+        session,
+        "denon-volume.local",
+        80,
+        "a" * 64,
+        "com.netflix.Netflix",
+        "Netflix",
+        playback_active=False,
+        event_id="1" * 32,
+        reauthorize_after_link_loss=True,
+    )
+    assert session.post.call_args.kwargs["json"] == {
+        "app_id": "com.netflix.Netflix",
+        "app_name": "Netflix",
+        "playback_active": False,
+        "event_id": "1" * 32,
+        "reauthorize_after_link_loss": True,
     }
 
     await async_send_app(
@@ -1172,6 +1278,110 @@ async def test_app_handoff_carries_only_known_playback_safety() -> None:
         "app_id": "com.netflix.Netflix",
         "app_name": "Netflix",
     }
+
+
+async def test_reauthorization_flag_falls_back_once_for_old_firmware() -> None:
+    """An old ESP receives the same idempotent event without the new field."""
+    session = MagicMock()
+    unsupported = MagicMock()
+    unsupported.raise_for_status.side_effect = ClientResponseError(
+        Mock(), (), status=400
+    )
+    accepted = MagicMock()
+    requests = []
+    for response in (unsupported, accepted):
+        request = MagicMock()
+        request.__aenter__ = AsyncMock(return_value=response)
+        request.__aexit__ = AsyncMock(return_value=None)
+        requests.append(request)
+    session.post.side_effect = requests
+
+    await async_send_app(
+        session,
+        "denon-volume.local",
+        80,
+        "a" * 64,
+        "com.netflix.Netflix",
+        "Netflix",
+        playback_active=False,
+        event_id="1" * 32,
+        reauthorize_after_link_loss=True,
+    )
+
+    assert session.post.call_count == 2
+    flagged = session.post.call_args_list[0].kwargs["json"]
+    fallback = session.post.call_args_list[1].kwargs["json"]
+    assert flagged == {
+        "app_id": "com.netflix.Netflix",
+        "app_name": "Netflix",
+        "playback_active": False,
+        "event_id": "1" * 32,
+        "reauthorize_after_link_loss": True,
+    }
+    assert fallback == {
+        "app_id": "com.netflix.Netflix",
+        "app_name": "Netflix",
+        "playback_active": False,
+        "event_id": "1" * 32,
+    }
+
+
+async def test_supported_reauthorization_sends_flag_once() -> None:
+    """A current ESP accepts one flagged request without a fallback."""
+    session = MagicMock()
+    response = MagicMock()
+    request = MagicMock()
+    request.__aenter__ = AsyncMock(return_value=response)
+    request.__aexit__ = AsyncMock(return_value=None)
+    session.post.return_value = request
+
+    await async_send_app(
+        session,
+        "denon-volume.local",
+        80,
+        "a" * 64,
+        "com.netflix.Netflix",
+        "Netflix",
+        playback_active=False,
+        event_id="1" * 32,
+        reauthorize_after_link_loss=True,
+    )
+
+    session.post.assert_called_once()
+    assert session.post.call_args.kwargs["json"]["reauthorize_after_link_loss"] is True
+
+
+@pytest.mark.parametrize(
+    ("reauthorize_after_link_loss", "status"), [(False, 400), (True, 503)]
+)
+async def test_reauthorization_fallback_does_not_change_other_errors(
+    reauthorize_after_link_loss: bool, status: int
+) -> None:
+    """Only a flagged request rejected as unknown gets the compatibility retry."""
+    session = MagicMock()
+    response = MagicMock()
+    response.raise_for_status.side_effect = ClientResponseError(
+        Mock(), (), status=status
+    )
+    request = MagicMock()
+    request.__aenter__ = AsyncMock(return_value=response)
+    request.__aexit__ = AsyncMock(return_value=None)
+    session.post.return_value = request
+
+    with pytest.raises(ClientResponseError):
+        await async_send_app(
+            session,
+            "denon-volume.local",
+            80,
+            "a" * 64,
+            "com.netflix.Netflix",
+            "Netflix",
+            playback_active=False,
+            event_id="1" * 32,
+            reauthorize_after_link_loss=reauthorize_after_link_loss,
+        )
+
+    session.post.assert_called_once()
 
 
 async def test_unpair_uses_bearer_token() -> None:

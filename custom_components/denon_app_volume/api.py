@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import re
 from typing import Any
 
-from aiohttp import ClientError, ClientSession, ClientTimeout
+from aiohttp import ClientError, ClientResponseError, ClientSession, ClientTimeout
 from yarl import URL
 
 from .const import (
@@ -123,6 +123,7 @@ async def async_send_app(
     *,
     playback_active: bool | None = None,
     event_id: str | None = None,
+    reauthorize_after_link_loss: bool = False,
 ) -> None:
     """Send the current Apple TV app to the paired ESP32."""
     payload: dict[str, str | bool] = {
@@ -133,13 +134,24 @@ async def async_send_app(
         payload["playback_active"] = playback_active
     if event_id is not None:
         payload["event_id"] = event_id
-    async with session.post(
-        device_url(host, port, "/api/app"),
-        headers={"Authorization": f"Bearer {token}"},
-        json=payload,
-        timeout=_TIMEOUT,
-    ) as response:
-        response.raise_for_status()
+    if reauthorize_after_link_loss:
+        payload["reauthorize_after_link_loss"] = True
+    url = device_url(host, port, "/api/app")
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        async with session.post(
+            url, headers=headers, json=payload, timeout=_TIMEOUT
+        ) as response:
+            response.raise_for_status()
+    except ClientResponseError as err:
+        if not reauthorize_after_link_loss or err.status != 400:
+            raise
+        fallback_payload = payload.copy()
+        fallback_payload.pop("reauthorize_after_link_loss")
+        async with session.post(
+            url, headers=headers, json=fallback_payload, timeout=_TIMEOUT
+        ) as response:
+            response.raise_for_status()
 
 
 def backup_payload(apps: tuple[AppVolume, ...]) -> dict[str, Any]:

@@ -323,16 +323,32 @@ assert "memcmp(&readback, &apps[i]" in backup
 receive_app = source[source.index("void receiveApp()") : source.index("void sendApps()")]
 assert "hasAppAuthorization()" in receive_app
 assert 'parseAppJson(server.arg("plain"), appId, appName, eventId' in receive_app
-assert "queueAppCandidate(appId, appName, playbackKnown, playbackActive, eventId);" in receive_app
+assert "reauthorizeAfterLinkLoss" in receive_app
+assert "queueAppCandidate(appId, appName, playbackKnown, playbackActive, eventId," in receive_app
 assert receive_app.index("if (appId.isEmpty())") < receive_app.index(
     "if (isIgnoredAppId(appId))"
 ) < receive_app.index("queueAppCandidate(appId, appName, playbackKnown")
+ignored_app = receive_app[
+    receive_app.index("if (isIgnoredAppId(appId))") : receive_app.index(
+        "const bool validIdleEvent"
+    )
+]
+assert ignored_app.index("invalidateReconnectRestore();") < ignored_app.index(
+    "server.send(204);"
+)
 assert "validPlaybackEventId(eventId.c_str(), eventId.length())" in receive_app
 assert "playbackIdleEventReady(" in receive_app
 assert 'server.send(503, "text/plain"' in receive_app
 assert receive_app.index("playbackIdleEventReady(") < receive_app.index(
     'server.send(503, "text/plain"'
 ) < receive_app.index("queueAppCandidate(appId, appName, playbackKnown")
+not_ready = receive_app[
+    receive_app.index("if (validIdleEvent &&") : receive_app.index(
+        "queueAppCandidate(appId, appName"
+    )
+]
+assert "!reconnectRestoreMatches(appId, eventId)" in not_ready
+assert "invalidateReconnectRestore();" in not_ready
 app_switch = source[
     source.index("void queueAppCandidate(") : source.index("void observeVolume(")
 ]
@@ -340,6 +356,9 @@ clear_app = source[
     source.index("void clearCurrentApp(") : source.index("void queueAppCandidate(")
 ]
 assert "currentAppId = \"\";" in clear_app
+assert clear_app.index("invalidateReconnectRestore();") < clear_app.index(
+    'currentAppId = "";'
+)
 assert "appClearCancelsVolumeTarget(restoreTargetRaw, restoreAutomatic)" in clear_app
 assert "if (restoreTargetRaw < 0 || restoreAutomatic)" not in clear_app
 activate_app = app_switch[
@@ -371,6 +390,13 @@ assert "if (!idleAuthorized && restoreAutomaticMuteCycle) cancelVolumeRestore();
 assert "validPlaybackEventId(eventId.c_str(), eventId.length())" in queue_app
 assert "playbackIdleEventGrants(" in queue_app
 assert "copyText(lastPlaybackIdleEventId" in queue_app
+assert "reauthorizeAfterLinkLoss && reconnectIdentityMatches" in queue_app
+assert "!reauthorizeAfterLinkLoss &&" in queue_app
+assert "idleAuthorized || (playbackKnown && playbackActive)" in queue_app
+assert "if (reconnectRestoreTargetRaw >= 0 && !reconnectIdentityMatches)" in queue_app
+assert queue_app.index("if (pendingReconnectTargetRaw >= 0)") < queue_app.index(
+    "const bool reconnectIdentityMatches"
+)
 same_current = queue_app[
     queue_app.index("if (appId == currentAppId)") :
     queue_app.index("if (appId == pendingAppId)")
@@ -379,6 +405,12 @@ assert same_current.index("if (!duplicateIdleEvent)") < (
     same_current.index("currentPlaybackAt = now;")
 )
 assert "!duplicateIdleEvent && (hadPendingSwitch || idleAuthorized)" in same_current
+assert same_current.index("if (reconnectAuthorized)") < same_current.index(
+    "startRestoreForCurrentApp();"
+)
+assert same_current.index("clearReconnectRestore();") < same_current.index(
+    "setVolume(retryTargetRaw, true);"
+)
 same_pending = queue_app[
     queue_app.index("if (appId == pendingAppId)") :
     queue_app.index("if (!currentAppId.isEmpty()")
@@ -386,8 +418,12 @@ same_pending = queue_app[
 assert same_pending.index("if (!duplicateIdleEvent)") < (
     same_pending.index("pendingPlaybackAt = now;")
 )
-assert "pendingRestoreAllowed = !duplicateIdleEvent;" in queue_app
-assert "if (restoreAllowed) startRestoreForCurrentApp();" in activate_app
+assert queue_app.count("pendingRestoreAllowed = restoreAuthorized;") == 2
+assert "pendingReconnectTargetRaw = reconnectRestoreTargetRaw;" in queue_app
+assert "if (restoreAllowed)" in activate_app
+assert "if (retryTargetRaw >= 0)" in activate_app
+assert "setVolume(retryTargetRaw, true);" in activate_app
+assert "startRestoreForCurrentApp();" in activate_app
 volume_restore = source[
     source.index("void resetVolumeRestore(") : source.index("bool parseVolumePacket(")
 ]
@@ -452,7 +488,14 @@ assert observe_mute.index("manualMuteLocked = true;") < observe_mute.index(
     "cancelVolumeRestore();"
 )
 assert "const bool becameMuted = !muteStateKnown || !denonMuted;" in observe_mute
+assert "const bool becameUnmuted = muteStateKnown && denonMuted && !muted;" in observe_mute
+assert observe_mute.index("if (automaticRemuteRequired)") < observe_mute.index(
+    "if (becameUnmuted) invalidateReconnectRestore();"
+)
 assert "if (!becameMuted) return;" in observe_mute
+assert observe_mute.index("if (!becameMuted) return;") < observe_mute.index(
+    "invalidateReconnectRestore();", observe_mute.index("if (!becameMuted) return;")
+) < observe_mute.index("manualMuteLocked = true;")
 assert "if (automaticRemuteRequired)" in observe_mute
 assert "restoreAutomaticUnmuteObserved = true;" in observe_mute
 assert "automaticRemuteConfirmed(" in observe_mute
@@ -621,6 +664,11 @@ observe_volume_target = volume_restore[
     volume_restore.index("if (restoreTargetRaw >= 0)") :
     volume_restore.index("if (restoreLearningSuppressed)")
 ]
+assert observe_volume_target.index("restoreAutomatic && restoreSteps > 0") < (
+    observe_volume_target.index("validateActiveBurstFeedback(raw)")
+)
+assert "!volumeMovementInDirection(previousRaw, raw" in observe_volume_target
+assert 'failVolumeRestore("wrong_direction")' in observe_volume_target
 assert observe_volume_target.index("validateActiveBurstFeedback(raw)") < (
     observe_volume_target.index("VolumeTargetPhase::waitFreshStatus")
 )
@@ -645,11 +693,25 @@ assert "restoreBurstMeasuredDeltaRaw = abs(raw - restoreBurstStartRaw);" in (
 assert "restoreBurstMeasuredClicks = restoreBurstClicksSent;" in (
     wait_movement_feedback
 )
+assert "restoreBurstActive = !restoreBurstExtensionPending;" in (
+    wait_movement_feedback
+)
 assert "automaticRestoreCommandAllowed()" in wait_movement_feedback
 assert "timeReached(now, restoreDeadlineAt)" in wait_movement_feedback
 assert "restoreSteps," in wait_movement_feedback
+wait_burst_feedback = volume_restore[
+    volume_restore.index("if (restorePhase == VolumeTargetPhase::waitBurstSecond)") :
+    volume_restore.index("if (restorePhase == VolumeTargetPhase::settling)")
+]
+assert wait_burst_feedback.index("restoreBurstExtensionPending &&") < (
+    wait_burst_feedback.index("restoreObservedRaw = raw;")
+)
+assert "volumeRapidFeedbackValid(" in wait_burst_feedback
+assert '"rapid_gain_exceeded"' in wait_burst_feedback
+assert '"wrong_direction"' in wait_burst_feedback
+assert "failVolumeRestore(reason);" in wait_burst_feedback
+assert "restoreBurstActive = true;" in wait_burst_feedback
 assert "kRestoreMaxSteps" in wait_movement_feedback
-assert "restoreBurstActive = false;" in wait_movement_feedback
 assert "restoreBurstExtensionPending = volumeRapidExtensionAllowed(" in (
     wait_movement_feedback
 )
@@ -766,11 +828,17 @@ assert send_target.index("server.send(423") < send_target.index("setVolume(")
 assert send_volume.index("sendDenon(") < send_volume.index(
     "acceptManualVolumeFeedback(direction);"
 )
+assert send_volume.index("sendDenon(") < send_volume.index(
+    "invalidateReconnectRestore();"
+)
 assert (
     send_target.index("acceptManualVolumeFeedback(volumeDirection(volumeRaw, targetRaw));")
     < send_target.index("setVolume(")
 )
 assert "setVolume(targetRaw, false)" in send_target
+assert send_target.index("setVolume(targetRaw, false)") < send_target.index(
+    "invalidateReconnectRestore();"
+)
 manual_auth = source[
     source.index("bool isLocalControlHost(") : source.index(
         "bool apiClaimWindowOpen()"
@@ -782,8 +850,40 @@ assert "host == hostName + \".local\"" in manual_auth
 assert "host == WiFi.localIP().toString()" in manual_auth
 assert "currentRequestUsesSetupAp() || hasAppAuthorization()" in manual_auth
 assert "if (restoreTargetRaw >= 0) armVolumeTargetSession(now);" in maintain
-assert "pauseVolumeTargetSession();" in maintain
-assert "automaticMuteConfirmationPending = false;" in maintain
+disconnect = maintain[
+    maintain.index("if (wasDenonConnected)") : maintain.index(
+        'Serial.println("Denon disconnected")'
+    )
+]
+assert "const bool quarantineAutomaticFeedback = restoreAutomatic;" in disconnect
+assert "restoreAutomatic && currentPlaybackIdleAuthorized" in disconnect
+assert "rememberReconnectRestore(currentAppId, lastPlaybackIdleEventId" in disconnect
+assert "pendingAppId.isEmpty()" in disconnect
+assert "rememberReconnectRestore(pendingAppId, lastPlaybackIdleEventId" in disconnect
+assert "if (restoreAutomatic || automaticRemuteRequired)" in disconnect
+assert disconnect.index("rememberReconnectRestore(") < disconnect.index(
+    "currentPlaybackIdleAuthorized = false;"
+)
+assert disconnect.index("pendingRestoreAllowed = false;") < disconnect.index(
+    "cancelVolumeRestore();"
+)
+assert disconnect.index("cancelVolumeRestore();") < disconnect.index(
+    "restoreLearningSuppressed = true;"
+)
+assert disconnect.index("restoreLearningSuppressed = true;") < disconnect.index(
+    "restoreFailureRaw = -1;"
+)
+assert "restoreLearningResumeAt = now + kVolumeStepResponseTimeoutMs;" in disconnect
+assert "pauseVolumeTargetSession();" in disconnect
+assert "automaticMuteConfirmationPending = false;" in disconnect
+reconnect_helpers = source[
+    source.index("void clearReconnectRestore()") : source.index(
+        "bool reconnectRestoreMatches("
+    )
+]
+assert "pendingReconnectTargetRaw = -1;" in reconnect_helpers
+assert "pendingRestoreAllowed = false;" in reconnect_helpers
+assert "pendingPlaybackIdleAuthorized = false;" in reconnect_helpers
 assert setup.index("networkSelfCheck()") < setup.index('preferences.begin("denon", false)')
 assert 'automaticRemuteRequired = preferences.getBool("remute", false);' in setup
 assert setup.index("loadDeviceIdentity();") < setup.index("loadAppVolumes();") < setup.index(

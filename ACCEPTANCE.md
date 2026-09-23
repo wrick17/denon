@@ -158,6 +158,13 @@ Home Assistant candidate, and only then run the pending physical rows. No
 candidate behavior below may be marked passed from code review, tests, or that
 failed deployment.
 
+The 2026-09-24 candidate review additionally revokes reconnect permission when
+the receiver first reports muted after reconnect. Local tests and the firmware
+build pass; physical link-loss acceptance remains deferred. A physical volume
+change made while Bluetooth is disconnected cannot yet be distinguished from
+delayed automatic feedback, so a recovery replay may overwrite that change.
+The artifact hashes above are historical and do not identify this revision.
+
 The current read-only baseline is deliberately not a deployment window: ESP32
 HTTP is reachable on wall power and reports idle with no restore error, but no
 Mac serial device is present. YouTube is active at raw 104/display 52.0. Do not

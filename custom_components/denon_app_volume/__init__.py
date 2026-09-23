@@ -177,6 +177,12 @@ class AppRelay:
         ):
             return True
 
+        send_options: dict[str, Any] = {
+            "playback_active": payload[2],
+            "event_id": payload[3],
+        }
+        if not fresh_foreground and payload[2] is False:
+            send_options["reauthorize_after_link_loss"] = True
         try:
             await async_send_app(
                 self._session,
@@ -185,8 +191,7 @@ class AppRelay:
                 self._token,
                 payload[0],
                 payload[1],
-                playback_active=payload[2],
-                event_id=payload[3],
+                **send_options,
             )
         except ClientResponseError as err:
             if err.status == 401:
@@ -260,6 +265,13 @@ class AppRelay:
                 return None
             return self._revocation()
         if not fresh_foreground:
+            if (
+                foreground is not None
+                and event_id is not None
+                and self._last_sent
+                == (foreground[0], foreground[1], False, event_id)
+            ):
+                return self._last_sent
             return self._revocation()
         if foreground is None:
             return self._revocation()
