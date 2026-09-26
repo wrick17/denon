@@ -83,6 +83,20 @@ reachable before removing the recovery path. If a later router or network change
 strands the static address after the access point has closed, power-cycle the
 ESP32 to reopen it.
 
+The Wi-Fi recovery firmware retries the saved station connection every 30
+seconds while disconnected from the access point, including when the framework
+stops automatic retries. It leaves an existing association alone while DHCP
+finishes. It retains the setup access point and saved network settings. It does not reboot
+the device or alter Bluetooth pairing and app volumes. The production-base
+network patch was installed and passed a controlled station-recovery test on
+September 26, 2026; see `ACCEPTANCE.md` for evidence and remaining limits.
+
+`GET /api/state` also reports uptime, free and minimum free
+heap, Wi-Fi signal strength, fallback retry count, and the last disconnect
+reason. Serial output records boot reset reason and disconnect/retry events.
+Counters and the last disconnect reason are volatile and reset on reboot;
+capture serial output before restarting a failed device when possible.
+
 To change an installed device's preferred address, send the new `ip` to the
 protected local network endpoint. To return to DHCP, delete that configuration:
 
@@ -160,15 +174,15 @@ runs unprivileged. After installing the files, enable `appletv-tunneld.service`
 and `appletv-foreground.service`. A healthy collector publishes retained MQTT
 discovery, foreground state, and availability at QoS 1.
 
-With the default DVT polling enabled, DVT is the sole state authority. Syslog
-can add diagnostic lifecycle records but cannot keep the sensor online or
-change its state. A failed or ambiguous DVT snapshot makes the MQTT sensor
+With the default DVT polling enabled, DVT is the sole state authority and the
+unused syslog reader is not started. Setting `DVT_POLL_SECONDS=0` selects the
+legacy syslog mode. A failed or ambiguous DVT snapshot makes the MQTT sensor
 unavailable and preserves the last retained identity rather than publishing a
 false clear.
 
 A brief ambiguous reading during an ordinary app switch does not add a recovery
 delay: if the previous accepted sample is at most one second old and a unique
-app returns within one second of the first ambiguous reading, it is published
+app returns within 1.5 seconds of the first ambiguous reading, it is published
 immediately. Availability remains offline until that fresh reading arrives.
 Screensaver clears, connection failures, malformed snapshots, and longer gaps
 retain the three-second stable-app guard. The screensaver itself never selects
@@ -229,7 +243,7 @@ so Home Assistant can deliver that same transition after readiness.
 
 This means Spotify can keep playing at its own volume while the user browses
 another app. The browsed app is applied only after it becomes eligible. After a
-1.5-second identity debounce, the ESP32:
+750 ms identity debounce, the ESP32:
 
 - saves the current Denon volume for the outgoing app;
 - restores the incoming app's saved volume with feedback-bounded accelerated
@@ -416,6 +430,13 @@ authoritative pass/fail rows are in `ACCEPTANCE.md`.
 
 ## Reset and re-pair
 
+If the ESP32 is reachable over Wi-Fi but Bluetooth remains disconnected after
+a full power cycle, briefly put the receiver in pairing mode by holding the
+remote's Bluetooth button for three seconds. In the September 26 tests this
+restored the existing bond without forgetting or re-pairing the device; return
+to TV Audio afterward. Automatic Bluetooth reconnection after power cycling
+remains unreliable on the tested receiver. See `ACCEPTANCE.md`.
+
 - For a normal Home Assistant removal, call authenticated `POST /api/unpair`
   before deleting the integration entry. It clears only the API token and opens
   a new ten-minute claim window.
@@ -437,6 +458,7 @@ Firmware build and protocol checks:
 ```sh
 PLATFORMIO_CORE_DIR="$PWD/.pio-home" .venv/bin/pio run
 .venv/bin/python test/protocol_check.py
+.venv/bin/python test/wifi_recovery_check.py
 c++ -std=c++17 -Wall -Wextra -Werror -pedantic \
   test/volume_target_check.cpp -o /tmp/volume-target-check
 /tmp/volume-target-check

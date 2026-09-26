@@ -49,7 +49,8 @@ _VALUE_TEMPLATE = (
 _RECONNECT_MAX_SECONDS = 30.0
 _RECONNECT_STABLE_SECONDS = 30.0
 _DVT_SETTLE_SECONDS = 3.0
-_DVT_AMBIGUITY_SECONDS = 1.0
+_DVT_LAST_GOOD_SECONDS = 1.0
+_DVT_AMBIGUITY_SECONDS = 1.5  # Allow one extra 0.5s poll to resolve a fresh ambiguity.
 
 
 def _app_name(app_id: str) -> str:
@@ -285,7 +286,7 @@ class DvtSettleGuard:
         if (
             not self.armed
             and self.last_good_at is not None
-            and now - self.last_good_at <= self.ambiguity_seconds
+            and now - self.last_good_at <= _DVT_LAST_GOOD_SECONDS
         ):
             self.armed = True
             self.ambiguity_since = now
@@ -778,6 +779,9 @@ def main() -> int:
         dvt_thread.start()
 
     try:
+        if dvt_enabled:
+            dvt_stop.wait()
+            return 0
         while True:
             logging.info("Connecting to Apple TV syslog")
             stream_started_at = time.monotonic()

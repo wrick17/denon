@@ -8,6 +8,8 @@
 #include <esp_a2dp_api.h>
 #include <esp_gap_bt_api.h>
 #include <esp_system.h>
+#include <esp_wifi.h>
+#include <atomic>
 
 #include "config.h"
 #include "volume_target.h"
@@ -27,6 +29,7 @@ constexpr char kMdnsService[] = "denon-volume";
 constexpr char kApiVersion[] = "1";
 constexpr uint16_t kHttpPort = 80;
 constexpr unsigned long kWifiTimeoutMs = 15000;
+constexpr uint32_t kWifiReconnectMs = 30000;
 constexpr unsigned long kReconnectMs = 5000;
 constexpr unsigned long kStatusIntervalMs = 5000;
 constexpr unsigned long kBondRemovalTimeoutMs = 3000;
@@ -146,6 +149,10 @@ int reconnectRestoreTargetRaw = -1;
 int pendingReconnectTargetRaw = -1;
 unsigned long apiClaimUntil = 0;
 bool wifiWasConnected = false;
+bool wifiConfigured = false;
+uint32_t wifiLastRetryAt = 0;
+uint32_t wifiRetryCount = 0;
+std::atomic<int> lastWifiDisconnectReason{-1};
 bool staticNetworkEnabled = false;
 IPAddress staticIp;
 IPAddress staticGateway;
@@ -648,7 +655,8 @@ bool finishPendingStaticNetwork() {
 void startWifi() {
   String ssid = preferences.getString("wifi_ssid", WIFI_SSID);
   String password = preferences.getString("wifi_password", WIFI_PASSWORD);
-  if (ssid.isEmpty()) {
+  wifiConfigured = !ssid.isEmpty();
+  if (!wifiConfigured) {
     startSetupAp();
     return;
   }
@@ -664,6 +672,7 @@ void startWifi() {
   if (staticNetworkEnabled) startSetupAp();
   WiFi.begin(ssid.c_str(), password.c_str());
   wifiStartedAt = millis();
+  wifiLastRetryAt = static_cast<uint32_t>(wifiStartedAt);
   Serial.printf("Connecting to Wi-Fi %s\n", ssid.c_str());
 }
 
@@ -671,6 +680,7 @@ void maintainWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     if (!wifiWasConnected) {
       wifiWasConnected = true;
+      wifiLastRetryAt = static_cast<uint32_t>(millis());
       if (!staticNetworkEnabled && finishPendingStaticNetwork()) return;
       if (apiToken.isEmpty()) apiClaimUntil = millis() + kApiClaimWindowMs;
     }
@@ -697,12 +707,25 @@ void maintainWifi() {
     wifiWasConnected = false;
     if (staticNetworkEnabled) stationHttpClaimed = false;
     wifiStartedAt = millis();
+    wifiLastRetryAt = static_cast<uint32_t>(wifiStartedAt);
     if (mdnsRunning) {
       MDNS.end();
       mdnsRunning = false;
     }
   }
   if (!setupApRunning && millis() - wifiStartedAt >= kWifiTimeoutMs) startSetupAp();
+  const uint32_t now = static_cast<uint32_t>(millis());
+  if (wifiConfigured &&
+      static_cast<uint32_t>(now - wifiLastRetryAt) >= kWifiReconnectMs) {
+    wifiLastRetryAt = now;
+    wifi_ap_record_t associatedAp;
+    if (esp_wifi_sta_get_ap_info(&associatedAp) == ESP_OK) return;
+    ++wifiRetryCount;
+    const esp_err_t result = esp_wifi_connect();
+    Serial.printf("Wi-Fi retry %lu: connect result 0x%x\n",
+                  static_cast<unsigned long>(wifiRetryCount),
+                  static_cast<unsigned>(result));
+  }
 }
 
 bool sendDenon(const uint8_t *command, size_t length) {
@@ -2850,7 +2873,17 @@ void sendState() {
   body += ",\"volume_target_id\":" + String(volumeTargetGeneration);
   body += ",\"ip\":\"" + jsonEscape(ip) + "\",\"network_mode\":\"" +
           String(staticNetworkEnabled ? "static" : "dhcp") +
-          "\",\"hostname\":\"" + jsonEscape(hostName) + ".local\"}";
+          "\",\"hostname\":\"" + jsonEscape(hostName) + ".local\"";
+  body += ",\"uptime_ms\":" + String(millis()) +
+          ",\"free_heap_bytes\":" + String(ESP.getFreeHeap()) +
+          ",\"min_free_heap_bytes\":" + String(ESP.getMinFreeHeap()) +
+          ",\"wifi_retry_count\":" + String(wifiRetryCount) +
+          ",\"wifi_rssi_dbm\":";
+  body += WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : "null";
+  body += ",\"wifi_last_disconnect_reason\":";
+  const int reason = lastWifiDisconnectReason.load(std::memory_order_relaxed);
+  body += reason < 0 ? "null" : String(reason);
+  body += "}";
   server.send(200, "application/json", body);
 }
 
@@ -3205,6 +3238,7 @@ void setupWeb() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.printf("Boot reset reason: %d\n", static_cast<int>(esp_reset_reason()));
   pinMode(kBootButtonPin, INPUT_PULLUP);
   if (!protocolSelfCheck() || !appStateSelfCheck() || !jsonSelfCheck() ||
       !networkSelfCheck()) {
@@ -3218,6 +3252,13 @@ void setup() {
   loadDeviceIdentity();
   loadAppVolumes();
   loadDenonMac();
+  WiFi.onEvent(
+      [](arduino_event_id_t, arduino_event_info_t info) {
+        const int reason = info.wifi_sta_disconnected.reason;
+        lastWifiDisconnectReason.store(reason, std::memory_order_relaxed);
+        Serial.printf("Wi-Fi station disconnected, reason %d\n", reason);
+      },
+      ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   startWifi();
   serialBt.enableSSP();
   serialBt.onConfirmRequest(confirmDenonPairing);

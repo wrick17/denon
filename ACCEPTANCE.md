@@ -1,5 +1,143 @@
 # Physical end-to-end acceptance
 
+## Outlet-power follow-up and repository cleanup · September 26, 2026
+
+The user moved the ESP32 to its usual outlet and position. Wi-Fi returned and
+all 14 saved app rows survived. Bluetooth did not automatically reconnect after
+that full power cycle. Briefly entering receiver pairing mode restored the
+existing bond without forgetting or re-pairing either device. After returning
+to TV Audio, the user confirmed Home → YouTube switching worked in both
+directions; final readback was connected, idle and error-free.
+
+Automatic Bluetooth reconnection after a full ESP32 power cycle is therefore
+still unreliable. The network retry fix avoids rebooting the controller for
+ordinary Wi-Fi loss, but it does not establish a fix for the receiver failing
+to answer Bluetooth connection attempts. Long-term reliability remains a
+normal-use check.
+
+Final combined checks passed 51 Home Assistant tests, 33 collector tests,
+protocol, Wi-Fi recovery, strict C++ volume-controller and WebUI checks, privacy
+checks and diff validation. CI now includes the new Wi-Fi and collector checks.
+
+Generated browser captures, test caches and build output were removed. The
+superseded status dashboard, historical blog sources, unused version-locked
+Home Assistant patch and private rollback/evidence bundles were archived
+outside this checkout in the private `denon/2026-09-26` maintenance archive.
+The deployed firmware and full flash backup hashes were verified after moving.
+The local virtual environment and PlatformIO toolchain remain for development.
+
+## Home return latency · September 26, 2026
+
+The user reported that returning Home started the volume change later than
+opening YouTube. Temporary collector tracing identified two different waits:
+
+- A fresh ambiguous foreground interval of 1.042 seconds crossed the one-second
+  grace threshold and added 3.403 seconds of stable-app waiting. A 0.944-second
+  interval took the fast path. The grace duration is now 1.5 seconds, one extra
+  poll; eligibility still requires a last good sample no older than one second.
+- A separate Home return hit the three-second DVT request timeout and then the
+  full recovery guard. The collector was also running a syslog subprocess that
+  consumed about 99% of one CPU core despite its events being ignored in DVT
+  mode. DVT mode now waits for its foreground worker without starting syslog.
+  Explicitly disabling DVT still selects the legacy syslog path.
+
+The final DVT-only test had two Home ambiguity intervals, 0.994 and 1.019 seconds,
+accepted immediately without the extra stable-app wait. No DVT timeout occurred
+in those two rounds. Receiver readback reached Home 50.0 and YouTube 48.0 on all
+four transitions; 48.0 was the user's current saved YouTube value during these
+later tests. The user reported Home was much better and the remaining difference
+was manageable. This short comparison does not prove the syslog reader caused
+the earlier timeout.
+
+The clean collector is deployed with SHA-256
+`afca8194c2f7a13af0fce2f0c66710d78503ce2e7bff085a55638d7f8e372743`.
+Temporary diagnostic logging was removed; service restart, MQTT publication
+and receiver connectivity passed afterward. The ESP32 retained the final
+network-recovery image without another firmware flash. These latency tests used Mac USB; the later outlet test is recorded above.
+
+All 33 collector tests pass. Regressions reproduced the recorded Home threshold
+failure and the unnecessary syslog startup before their fixes; stale-sample,
+long-ambiguity, overlay, transport-outage, legacy-mode and shutdown checks pass.
+Independent review found no remaining blocker. Privacy and diff checks pass.
+The original remote collector was backed up before changes; private timing
+traces and the final source/patch are retained with the device evidence.
+
+A bounded further timing review found no worthwhile simple change: Home remains
+ambiguous in the Apple TV's readings for about one second, individual DVT calls
+already take roughly 0.3–0.4 seconds, and the firmware's 750 ms stability check
+prevents transient identities from immediately selecting a volume. Faster
+polling would have limited benefit in these observations. The three-second
+outage/screensaver guard and firmware volume safeguards remain unchanged.
+
+## Wi-Fi dropout recovery · September 24–26, 2026
+
+The September 24 outage affected the ESP32 from both the Mac and Home Assistant
+host while the Apple TV collector continued publishing transitions. A power
+cycle restored Home 50.0 / Viki 62.0 switching. The original disconnect reason
+was not captured, so its precise cause remains unproven.
+
+The network-only fix is now installed on the accepted `0d06c30` production base.
+It retries a configured station every 30 seconds when disconnected from its
+access point, including when Arduino's automatic retries stop. It leaves an
+existing association alone while waiting for an IP address. It does not reboot
+the device or change Bluetooth and volume-control behavior. HEAD's unrelated
+guarded volume-recovery changes remain excluded from the installed image.
+
+Firmware SHA-256:
+`c38949f04bb35dc6eeb53a2768ec4697d4740d3a17751390ba7da937df36b8eb`.
+The immutable artifact, patch, build log and hash manifest are retained as
+`network-release-20260924/` in the private maintenance archive outside this
+checkout. Do not substitute a HEAD build.
+
+Installation and verification on September 26:
+
+- A private 4 MiB flash backup was captured at 115200 baud before installation.
+  Application-only writes at `0x10000` passed device data-hash verification.
+  NVS, partitions and bootloader were preserved.
+- A temporary acceptance image disabled framework auto-reconnect and deliberately
+  disconnected only the station. Serial recorded reason 8, the fallback retry
+  about 30 seconds later, and restored HTTP access about three seconds after
+  that. Uptime continued from 59.6 to 93.3 seconds without a reboot. Bluetooth
+  was disconnected and no app target was active during this fault test.
+- A separate 25-second Wi-Fi radio-off test still produced two Bluetooth page
+  timeouts. Enabling receiver pairing mode subsequently allowed the existing
+  bond to connect, with no new pairing or bond deletion. Standby On and
+  Auto-Select Off were confirmed by the user. The receiver's earlier refusal
+  to answer pages remains unexplained; Wi-Fi contention was not demonstrated.
+- The final firmware was restored after both probes. It automatically connected
+  over Bluetooth on TV Audio about four seconds after startup, without another
+  pairing-mode action. The final image contains no fault-injection hooks.
+- The saved receiver reference, network mode and all 14 app names/volumes match
+  the pre-install backup. The receiver reports bonded and no restore error.
+- Before the probes, the user confirmed all four YouTube → Home → YouTube
+  transitions across two rounds on this same final firmware. Home settled at
+  50.0 and YouTube at 45.0. After the probes were removed and the final image
+  restored, another four transitions passed both receiver readback and the
+  user's physical confirmation. No Bluetooth loss or restore errors occurred
+  during final observation; closing serial capture did not reset the board.
+
+Fault injection and initial switching tests used Mac USB power. The subsequent
+outlet-power acceptance is recorded above. Private serial/HTTP, flash and timing
+evidence is retained as `device-backup-20260926-111440/` in the maintenance
+archive outside this checkout.
+
+The four successful measured transitions took approximately 1.24–1.31 seconds
+from foreground MQTT publication to the first observed changed receiver volume.
+This is not button-press latency: HTTP sampling adds roughly 0.25–0.4 seconds
+of observation granularity and clock alignment has about ±0.07 seconds of
+uncertainty. The 750 ms app-stability guard and fresh receiver feedback remain.
+These measurements excluded the delay before publication. The later Home
+investigation above addressed that stage; firmware timing was not changed.
+
+Local validation passed actual-function Wi-Fi regression tests, firmware builds
+on HEAD and the production base, protocol/controller/Web UI checks, privacy
+checks and independent review. The Wi-Fi regression failed before the fix.
+
+This closes a demonstrated missing-retry path, not every possible outage.
+A firmware hang, power fault, connected-but-unreachable IP state, or future
+receiver refusal to answer Bluetooth pages needs separate evidence. Long-term
+normal use beyond the previous recurrence interval remains the durability check.
+
 ## Final production acceptance · September 6, 2026
 
 The user accepted the release and requested project closure. This section

@@ -22,6 +22,7 @@ jobs:
       - run: cp include/config.h.example include/config.h
       - run: pio run
       - run: python test/protocol_check.py
+      - run: python test/wifi_recovery_check.py
       - run: c++ -std=c++17 -Wall -Wextra -Werror -pedantic test/volume_target_check.cpp -o /tmp/volume-target-check && /tmp/volume-target-check
 
   repository-policy:
@@ -45,6 +46,7 @@ jobs:
           python-version: "3.13"
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m pytest -q tests
+      - run: python -m unittest tools.appletv_foreground.test_parser
 
   home-assistant:
     runs-on: ubuntu-latest

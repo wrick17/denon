@@ -2,10 +2,12 @@ import asyncio
 import json
 import os
 import re
+import sys
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 from tools.appletv_foreground.collector import (
     Config,
@@ -23,6 +25,7 @@ from tools.appletv_foreground.collector import (
     _source_is_authoritative,
     _source_timestamp,
     _state_payload,
+    main,
 )
 
 
@@ -82,6 +85,15 @@ class ForegroundTrackerTest(unittest.TestCase):
 
         self.assertTrue(guard.accepts("com.netflix.Netflix", 11.49))
 
+    def test_home_return_after_one_extra_dvt_poll_uses_default_grace(self) -> None:
+        # Captured Home return: unknown snapshots at 0.548 and 1.000 seconds,
+        # then HeadBoard 1.042 seconds after the first unknown snapshot.
+        guard = DvtSettleGuard()
+        self.assertTrue(guard.accepts("com.google.ios.youtube", 0.0))
+        guard.ambiguous(0.548)
+        guard.ambiguous(1.0)
+        self.assertTrue(guard.accepts("com.apple.HeadBoard", 1.590))
+
     def test_full_guard_cannot_be_shortcut_by_ambiguity(self) -> None:
         guard = DvtSettleGuard(3.0, ambiguity_seconds=1.0)
         self.assertTrue(guard.accepts("com.apple.HeadBoard", 15.0))
@@ -128,17 +140,17 @@ class ForegroundTrackerTest(unittest.TestCase):
         self.assertEqual(state.payload, payload)
 
     def test_prolonged_dvt_ambiguity_uses_full_settle_guard(self) -> None:
-        guard = DvtSettleGuard(3.0, ambiguity_seconds=1.0)
+        guard = DvtSettleGuard(3.0)
         self.assertTrue(guard.accepts("com.apple.HeadBoard", 20.0))
         guard.ambiguous(20.5)
-        guard.ambiguous(21.6)
+        guard.ambiguous(22.1)
 
-        self.assertFalse(guard.accepts("com.netflix.Netflix", 21.7))
-        self.assertFalse(guard.accepts("com.netflix.Netflix", 24.699))
-        self.assertTrue(guard.accepts("com.netflix.Netflix", 24.7))
+        self.assertFalse(guard.accepts("com.netflix.Netflix", 22.2))
+        self.assertFalse(guard.accepts("com.netflix.Netflix", 25.199))
+        self.assertTrue(guard.accepts("com.netflix.Netflix", 25.2))
 
     def test_stale_dvt_sample_cannot_open_ambiguity_grace(self) -> None:
-        guard = DvtSettleGuard(3.0, ambiguity_seconds=1.0)
+        guard = DvtSettleGuard(3.0)
         self.assertTrue(guard.accepts("com.apple.HeadBoard", 30.0))
         guard.ambiguous(31.001)
 
@@ -390,6 +402,61 @@ class ForegroundTrackerTest(unittest.TestCase):
                 "com.apple.HeadBoard", True, now + timedelta(seconds=10)
             )
         self.assertEqual(tracker.active_app, "com.netflix.Netflix")
+
+    def test_main_uses_syslog_only_without_dvt_and_cleans_up(self) -> None:
+        paho = ModuleType("paho")
+        paho.__path__ = []
+        mqtt_package = ModuleType("paho.mqtt")
+        mqtt_package.__path__ = []
+        mqtt = ModuleType("paho.mqtt.client")
+        mqtt.CallbackAPIVersion = SimpleNamespace(VERSION2=2)
+        paho.mqtt = mqtt_package
+        mqtt_package.client = mqtt
+        modules = {
+            "paho": paho,
+            "paho.mqtt": mqtt_package,
+            "paho.mqtt.client": mqtt,
+        }
+
+        for poll_seconds in (0.5, 0.0):
+            with self.subTest(poll_seconds=poll_seconds):
+                config = Config(
+                    "target", "127.0.0.1", 1883, None, None,
+                    "test", "homeassistant", 0.5, poll_seconds, 3.0,
+                )
+                client = Mock()
+                message = Mock(mid=1)
+                message.is_published.return_value = True
+                client.publish.return_value = message
+                mqtt.Client = Mock(return_value=client)
+                stop_event = Mock()
+                thread = Mock()
+                with (
+                    patch.dict(sys.modules, modules),
+                    patch.object(Config, "from_env", return_value=config),
+                    patch("tools.appletv_foreground.collector.threading.Event", return_value=stop_event),
+                    patch("tools.appletv_foreground.collector.threading.Thread", return_value=thread) as make_thread,
+                    patch("tools.appletv_foreground.collector.signal.signal"),
+                    patch("tools.appletv_foreground.collector.subprocess.Popen", side_effect=RuntimeError("legacy syslog started")) as popen,
+                ):
+                    if poll_seconds:
+                        self.assertEqual(main(), 0)
+                        popen.assert_not_called()
+                        make_thread.assert_called_once()
+                        thread.start.assert_called_once()
+                        thread.join.assert_called_once_with(timeout=2)
+                        stop_event.wait.assert_called_once_with()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "legacy syslog started"):
+                            main()
+                        popen.assert_called_once()
+                        make_thread.assert_not_called()
+                    stop_event.set.assert_called_once()
+                    client.publish.assert_any_call(
+                        "test/availability", "offline", qos=1, retain=True
+                    )
+                    client.disconnect.assert_called_once()
+                    client.loop_stop.assert_called_once()
 
     def test_first_authoritative_overlay_publishes_clear_before_online(self) -> None:
         tracker = ForegroundTracker()

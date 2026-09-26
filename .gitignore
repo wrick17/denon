@@ -5,3 +5,5 @@
 __pycache__/
 *.py[cod]
 include/config.h
+.pytest_cache/
+.playwright-cli/
