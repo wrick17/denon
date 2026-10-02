@@ -439,6 +439,9 @@ authoritative pass/fail rows are in `ACCEPTANCE.md`.
 
 ## Reset and re-pair
 
+For unattended fault history, [rolling server logs](tools/rolling_logs/README.md)
+documents the read-only 72-hour journal, container, MQTT and ESP32 archive.
+
 If the ESP32 is reachable over Wi-Fi but Bluetooth remains disconnected after
 a full power cycle, briefly put the receiver in pairing mode by holding the
 remote's Bluetooth button for three seconds. In the September 26 tests this

@@ -13,6 +13,7 @@
 
 #include "config.h"
 #include "bt_diagnostics.h"
+#include "network_logs.h"
 #include "volume_target.h"
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
@@ -2592,6 +2593,79 @@ bool requireBackupAuthorization() {
   return false;
 }
 
+bool parseLogQueryUnsigned(const String &text, uint32_t maximum,
+                           uint32_t &value) {
+  size_t position = 0;
+  return parseJsonUnsigned(text, position, value) &&
+         position == text.length() && value <= maximum;
+}
+
+void appendLogJsonText(String &body, const char *text, size_t length) {
+  constexpr char hex[] = "0123456789abcdef";
+  for (size_t i = 0; i < length; ++i) {
+    const uint8_t c = static_cast<uint8_t>(text[i]);
+    if (c == '"' || c == '\\') {
+      body += '\\';
+      body += static_cast<char>(c);
+    } else if (c < 0x20 || c >= 0x7F) {
+      body += "\\u00";
+      body += hex[c >> 4];
+      body += hex[c & 0x0F];
+    } else {
+      body += static_cast<char>(c);
+    }
+  }
+}
+
+void sendLogs() {
+  if (!requireBackupAuthorization()) return;
+  server.sendHeader("Cache-Control", "no-store");
+  uint32_t after = 0;
+  uint32_t limit = networkLogs::kMaxPage;
+  if ((server.hasArg("after") &&
+       !parseLogQueryUnsigned(server.arg("after"), UINT32_MAX, after)) ||
+      (server.hasArg("limit") &&
+       (!parseLogQueryUnsigned(server.arg("limit"), networkLogs::kMaxPage,
+                              limit) || limit == 0))) {
+    server.send(400, "text/plain", "Invalid log cursor or limit");
+    return;
+  }
+
+  networkLogs::flush();
+  const networkLogs::Stats stats = networkLogs::stats();
+  constexpr size_t kMaxResponseBytes = 3072;
+  String body;
+  if (!body.reserve(kMaxResponseBytes)) {
+    server.send(503, "text/plain", "Log response allocation failed");
+    return;
+  }
+  body += "{\"boot_id\":\"" + String(networkLogs::bootId()) +
+         "\",\"oldest_seq\":" + String(stats.oldestSeq) +
+         ",\"next_seq\":" + String(stats.nextSeq) +
+         ",\"dropped\":" + String(stats.dropped) + ",\"records\":[";
+  networkLogs::Record record;
+  for (uint32_t count = 0; count < limit &&
+                           networkLogs::readAfter(after, record); ++count) {
+    size_t encodedLength = 0;
+    for (size_t i = 0; i < record.length; ++i) {
+      const uint8_t c = static_cast<uint8_t>(record.text[i]);
+      encodedLength += c < 0x20 || c >= 0x7F ? 6 :
+                       c == '"' || c == '\\' ? 2 : 1;
+    }
+    if (body.length() + encodedLength + 128 + 2 > kMaxResponseBytes) break;
+    if (count) body += ',';
+    body += "{\"seq\":" + String(record.seq) +
+            ",\"uptime_ms\":" + String(record.uptimeMs) +
+            ",\"continued\":" + String(record.continued ? "true" : "false") +
+            ",\"text\":\"";
+    appendLogJsonText(body, record.text, record.length);
+    body += "\"}";
+    after = record.seq;
+  }
+  body += "]}";
+  server.send(200, "application/json", body);
+}
+
 void sendBackup() {
   if (!requireBackupAuthorization()) return;
   size_t indices[kMaxApps];
@@ -3230,6 +3304,7 @@ void setupWeb() {
   server.on("/api/unpair", HTTP_POST, unpairApi);
   server.on("/api/app", HTTP_POST, receiveApp);
   server.on("/api/apps", HTTP_GET, sendApps);
+  server.on("/api/logs", HTTP_GET, sendLogs);
   server.on("/api/backup", HTTP_GET, sendBackup);
   server.on("/api/backup", HTTP_PUT, restoreBackup);
   server.on("/api/state", HTTP_GET, sendState);
@@ -3253,6 +3328,7 @@ void setupWeb() {
 
 void setup() {
   Serial.begin(115200);
+  networkLogs::begin();
   Serial.printf("Boot reset reason: %d\n", static_cast<int>(esp_reset_reason()));
   pinMode(kBootButtonPin, INPUT_PULLUP);
   if (!protocolSelfCheck() || !appStateSelfCheck() || !jsonSelfCheck() ||

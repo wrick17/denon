@@ -1,5 +1,43 @@
 # Physical end-to-end acceptance
 
+## Rolling diagnostics archive · October 2, 2026
+
+The server now runs `denon-logs.service` with a private persistent SQLite archive
+and a rolling 72-hour window. Available journal and container history was imported;
+new MQTT, ESP32 state, and ESP32 text records are collected continuously. The
+dedicated MQTT account can read all ordinary and broker-system topics. Broker
+diagnostics are mirrored to the journal after a configuration reload. Existing
+Apple TV collector, tunnel, and broker processes were not restarted.
+
+The installed logging image is built from the accepted production base and its
+Wi-Fi/passive Bluetooth overlays, with only the network-log addition. Application
+flash verification passed; SHA-256 is
+`2c293d8a115c2cbe3805407567dff26f25c5e241572264290be572ef09738991`.
+The endpoint returned 401 without authorization and authenticated JSON within the
+3 KiB response cap. Arduino Serial and SDK Bluetooth text appeared in the archive.
+The first delayed activation missed twelve volatile chunks and recorded that gap;
+subsequent captured sequences were contiguous, including across recorder restart.
+Ring overwrite counts do not mean already archived records were lost.
+
+After this firmware restart, ACL connected at 144.602 seconds, SPP opened at
+145.100 seconds, and volume feedback arrived at 145.522 seconds. Logging remained
+enabled throughout. No receiver, input, pairing-mode, or bond action was needed.
+A brief remote SPP/A2DP close at about 156.7 seconds recovered on the existing ACL
+at 158.131 seconds. Neither event proves the original Bluetooth fault is fixed.
+Later bounded manual targets 47 → 45 → 47 settled in 2.05 and 2.03 seconds with
+logging enabled. Sampled volume stayed within 45–47, receiver state stayed
+connected and error-free, and saved app rows were unchanged. Minimum observed
+free heap was 20,432 bytes.
+
+Live source coverage, private file permissions, SQLite integrity, durable resume,
+and absence of records older than the retention window passed. Regression checks
+cover retention, redaction, bounded queues, safe disk exhaustion, MQTT commit
+acknowledgement, unsupported endpoints, authenticated paging and sequence gaps.
+Firmware builds, native hooks/API checks, existing protocol/Wi-Fi/controller/UI
+checks, 51 Home Assistant tests, 33 collector tests, and privacy scans passed.
+Logs emitted before installation, early ROM boot output, and unexported RAM data
+lost during resets or extended outages cannot be recovered.
+
 ## Bluetooth reconnect investigation · October 2, 2026
 
 The ESP32 was powered by Mac USB near the receiver, which was on TV Audio.

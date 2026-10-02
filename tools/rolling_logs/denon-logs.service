@@ -1,0 +1,27 @@
+[Unit]
+Description=Rolling 72-hour server and Denon diagnostic logs
+Wants=network-online.target
+After=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/appletv-foreground.env
+EnvironmentFile=/etc/denon-logs.env
+ExecStart=/opt/appletv-foreground/.venv/bin/python /opt/denon-logs/recorder.py
+Restart=on-failure
+RestartSec=10
+StateDirectory=denon-logs
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+Nice=10
+IOSchedulingClass=idle
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
