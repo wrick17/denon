@@ -1,5 +1,87 @@
 # Physical end-to-end acceptance
 
+## Bluetooth reconnect investigation · October 2, 2026
+
+The ESP32 was powered by Mac USB near the receiver, which was on TV Audio.
+A private full-flash backup matched the previously installed network-recovery
+application. Temporary inquiry and A2DP signaling probes were installed on the
+accepted `0d06c30` base plus that same Wi-Fi patch; unrelated HEAD volume and
+link-loss changes were excluded. Saved bonds were not deleted or re-paired.
+
+- A bounded inquiry did not find the receiver. Subsequent direct SPP attempts
+  still timed out. A single A2DP signaling attempt also failed with HCI status
+  `260` (page timeout); no audio stream was started.
+- The user fully disconnected receiver mains power and returned it to TV Audio
+  while leaving the ESP32 powered. After 59 recorded failed pages, an ACL
+  connection succeeded, SPP opened, and valid volume feedback arrived. The
+  receiver's incoming A2DP connection followed the successful SPP connection;
+  it was not evidence that the A2DP probe caused recovery.
+- The user then unplugged only ESP32 USB power for ten seconds and reconnected
+  it. With the receiver still on TV Audio and outside pairing mode, ACL connected
+  about 2.73 seconds after boot and SPP opened about 3.32 seconds after boot.
+  Volume feedback and idle, error-free state returned without pairing mode.
+- All 14 saved app rows matched preflight before the user's later manual volume
+  adjustment. The user subsequently set the receiver to 47; passive readback
+  confirmed connected, idle, 47.0 and no restore error.
+
+The receiver mains restart cleared the observed failed-reconnect condition.
+The original established-link disconnect was not captured, so neither its cause
+nor a permanent fix is proven. Retry timeouts must not be reported as the reason
+for the original dropout.
+
+A clean passive GAP diagnostics candidate is built on the accepted production
+base plus Wi-Fi recovery. It forwards all events to BluetoothSerial unchanged
+and retains the last established-link disconnect reason separately from failed
+connection attempts. Native callback regression, protocol, Wi-Fi recovery,
+volume-controller and WebUI checks pass. Its firmware SHA-256 is
+`efcdbe71f24288cac568af6d0ce3780db6c10b40eea5cf04576f03ddd180bdc4`.
+Independent review confirmed callback forwarding and linker interception with no
+concrete regression found. The integrated HEAD build, new-file and tracked-file
+privacy scans, and diff checks also pass; HEAD remains an offline check only.
+
+The user authorized installation. An application-only write at `0x10000` passed
+device data-hash verification, replacing the temporary probe image. The clean
+build connected on TV Audio without pairing mode: its first ACL success was at
+3.297 seconds after boot, volume remained 47.0, and all 14 app rows matched
+pre-install readback. The API reported one successful connection, with no
+established-link disconnect reason. A manual API target test moved 47 → 45 → 47,
+settling in about 2.44 and 2.18 seconds respectively; every sampled intermediate
+volume remained within the requested range, with no disconnect or restore error.
+
+The subsequent ESP32-only ten-second power cycle recovered automatically after
+three page timeouts `260` at 6.107, 16.287 and 26.467 seconds after boot. The next
+ACL attempt succeeded at 34.006 seconds; HTTP first showed SPP connected at
+34.713 seconds. No receiver or pairing-mode action was needed. An early state
+check incorrectly classified the delayed reconnect as a continuing failure;
+the complete recording supersedes that conclusion. All app rows remained
+unchanged. Opening serial later reset the ESP32 again, after the cold boot had
+already recovered, and that later boot connected at 4.965 seconds. A second
+ten-second ESP32-only power cycle, observed solely over HTTP with no serial port
+open, succeeded on its first ACL attempt at 4.805 seconds after boot. Volume
+returned to 47.0 with idle, error-free state and stayed connected through 100.389
+seconds of uptime, with no further ACL attempts or disconnect reason. The user
+confirmed the receiver displayed 47 and YouTube audio played normally.
+No permanent reconnect fix is accepted. Do not flash a HEAD build: it includes
+unrelated unaccepted controller changes.
+
+Both clean-build cold cycles recovered without a pairing-mode or receiver action,
+but latency varied. Receiver stale-link expiry plus retry timing is one possible
+explanation for the slower cycle, not a measured Denon timeout. No retry-policy
+or security change is justified by these results. The original normal-use
+dropout and earlier indefinitely stuck receiver condition remain unresolved;
+the passive diagnostics are retained to capture the next established-link loss.
+Any experimental volume changes must remain within display 45–47 (raw 90–94);
+saved app profiles are not to be globally clamped or rewritten for this test.
+Private flash, serial, state, probe and candidate artifacts are retained outside
+the checkout in the October 2 maintenance archive.
+
+Final combined checks passed the native callback regression, firmware builds on
+the production base and HEAD, protocol, Wi-Fi recovery, strict C++ controller,
+WebUI, 51 Home Assistant and 33 collector tests, privacy scans and diff validation.
+The installed image, symbols and reproducible patches were archived with verified
+checksums. Temporary worktrees and generated build/test files were removed;
+58.7 MiB was reclaimed. The development virtual environment and toolchain remain.
+
 ## Outlet-power follow-up and repository cleanup · September 26, 2026
 
 The user moved the ESP32 to its usual outlet and position. Wi-Fi returned and

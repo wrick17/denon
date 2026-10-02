@@ -97,6 +97,15 @@ reason. Serial output records boot reset reason and disconnect/retry events.
 Counters and the last disconnect reason are volatile and reset on reboot;
 capture serial output before restarting a failed device when possible.
 
+The Bluetooth diagnostics build adds `bt_acl_connect_count`,
+`bt_acl_last_connect_status`, `bt_acl_last_connect_at_ms`,
+`bt_acl_last_disconnect_reason`, and `bt_acl_last_disconnect_at_ms` to
+`GET /api/state`. These volatile fields observe the saved receiver's GAP events
+without changing connection or volume behavior. A disconnect reason is retained
+only for a previously established link; failed retries do not replace it.
+Times are milliseconds since boot, and unobserved statuses/times are `null`.
+The production-base build was installed on October 2; see `ACCEPTANCE.md`.
+
 To change an installed device's preferred address, send the new `ip` to the
 protected local network endpoint. To return to DHCP, delete that configuration:
 
@@ -436,6 +445,12 @@ remote's Bluetooth button for three seconds. In the September 26 tests this
 restored the existing bond without forgetting or re-pairing the device; return
 to TV Audio afterward. Automatic Bluetooth reconnection after power cycling
 remains unreliable on the tested receiver. See `ACCEPTANCE.md`.
+
+On October 2, a full receiver mains restart restored the existing connection
+after repeated Bluetooth page timeouts. A subsequent ESP32-only power cycle
+reconnected on TV Audio without pairing mode. This distinguishes mains restart
+from receiver standby, but does not establish the original dropout cause or a
+permanent fix. Capture diagnostics before either recovery action when possible.
 
 - For a normal Home Assistant removal, call authenticated `POST /api/unpair`
   before deleting the integration entry. It clears only the API token and opens

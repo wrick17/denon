@@ -23,6 +23,7 @@ jobs:
       - run: pio run
       - run: python test/protocol_check.py
       - run: python test/wifi_recovery_check.py
+      - run: c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Itest/bt_stubs -Iinclude test/bt_diagnostics_check.cpp -o /tmp/bt-diagnostics-check && /tmp/bt-diagnostics-check
       - run: c++ -std=c++17 -Wall -Wextra -Werror -pedantic test/volume_target_check.cpp -o /tmp/volume-target-check && /tmp/volume-target-check
 
   repository-policy:

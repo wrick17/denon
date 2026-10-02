@@ -12,6 +12,7 @@
 #include <atomic>
 
 #include "config.h"
+#include "bt_diagnostics.h"
 #include "volume_target.h"
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
@@ -2883,6 +2884,20 @@ void sendState() {
   body += ",\"wifi_last_disconnect_reason\":";
   const int reason = lastWifiDisconnectReason.load(std::memory_order_relaxed);
   body += reason < 0 ? "null" : String(reason);
+  body += ",\"bt_acl_connect_count\":" +
+          String(btDiagnostics::connectCount.load(std::memory_order_relaxed));
+  const int btStatus = btDiagnostics::lastConnectStatus.load(std::memory_order_relaxed);
+  body += ",\"bt_acl_last_connect_status\":";
+  body += btStatus < 0 ? "null" : String(btStatus);
+  body += ",\"bt_acl_last_connect_at_ms\":";
+  body += btStatus < 0 ? "null" :
+          String(btDiagnostics::lastConnectAtMs.load(std::memory_order_relaxed));
+  const int btReason = btDiagnostics::lastDisconnectReason.load(std::memory_order_relaxed);
+  body += ",\"bt_acl_last_disconnect_reason\":";
+  body += btReason < 0 ? "null" : String(btReason);
+  body += ",\"bt_acl_last_disconnect_at_ms\":";
+  body += btReason < 0 ? "null" :
+          String(btDiagnostics::lastDisconnectAtMs.load(std::memory_order_relaxed));
   body += "}";
   server.send(200, "application/json", body);
 }
