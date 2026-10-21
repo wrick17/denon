@@ -183,6 +183,16 @@ runs unprivileged. After installing the files, enable `appletv-tunneld.service`
 and `appletv-foreground.service`. A healthy collector publishes retained MQTT
 discovery, foreground state, and availability at QoS 1.
 
+If the collector cannot find the configured Apple TV for 60 seconds while
+tunneld stays reachable and lists no tunnels at all, the collector asks tunneld to exit through its loopback `/shutdown`
+endpoint, and `Restart=always` starts a fresh daemon. Repeat attempts back off
+from 2 minutes to 1 hour and reset after the next successful DVT snapshot. An
+unreachable daemon, a listed but unusable tunnel, and DVT errors never trigger
+this restart; each one restarts the 60-second count without resetting the
+backoff. Because tunneld keys Wi-Fi tunnels by pairing identifier rather than
+the configured UDID, any listed tunnel blocks the restart. This recovery
+therefore covers a single-device tunneld only.
+
 With the default DVT polling enabled, DVT is the sole state authority and the
 unused syslog reader is not started. Setting `DVT_POLL_SECONDS=0` selects the
 legacy syslog mode. A failed or ambiguous DVT snapshot makes the MQTT sensor

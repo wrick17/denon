@@ -15,6 +15,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
+from contextlib import suppress
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any
@@ -51,6 +53,9 @@ _RECONNECT_STABLE_SECONDS = 30.0
 _DVT_SETTLE_SECONDS = 3.0
 _DVT_LAST_GOOD_SECONDS = 1.0
 _DVT_AMBIGUITY_SECONDS = 1.5  # Allow one extra 0.5s poll to resolve a fresh ambiguity.
+_TUNNELD_URL = "http://127.0.0.1:49151"
+_TUNNELD_RECOVERY_SECONDS = 60.0  # 12 tunneld Wi-Fi monitor passes (5s each).
+_TUNNELD_RECOVERY_MAX_SECONDS = 3600.0
 
 
 def _app_name(app_id: str) -> str:
@@ -240,6 +245,53 @@ def _snapshot_foreground(processes: Any) -> str | None:
     return next(iter(candidates)) if len(candidates) == 1 else None
 
 
+class TunnelUnavailable(RuntimeError):
+    """tunneld returned no usable tunnel for the configured Apple TV."""
+
+
+class TunneldRecovery:
+    """Allow a tunneld restart only after a continuous, unrecovered absence."""
+
+    def __init__(self, seconds: float = _TUNNELD_RECOVERY_SECONDS) -> None:
+        self.seconds = seconds
+        self.present()
+
+    def present(self) -> None:
+        self.interrupt()
+        self.next_at = 0.0
+        self.attempts = 0
+
+    def interrupt(self) -> None:
+        self.absent_since: float | None = None
+
+    def due(self, now: float) -> bool:
+        if self.absent_since is None:
+            self.absent_since = now
+        return now - self.absent_since >= self.seconds and now >= self.next_at
+
+    def requested(self, now: float) -> None:
+        self.attempts += 1
+        self.next_at = now + min(
+            self.seconds * 2**self.attempts, _TUNNELD_RECOVERY_MAX_SECONDS
+        )
+
+
+def _recover_empty_tunneld(urlopen: Any = urllib.request.urlopen) -> bool:
+    with urlopen(f"{_TUNNELD_URL}/", timeout=2) as response:
+        tunnels = json.loads(response.read())
+    # tunneld keys Wi-Fi tunnels by pairing identifier, not the configured
+    # UniqueDeviceID, so only a completely empty map proves the device is gone.
+    # shortcut: never recovers one device while another is listed; add RSD
+    # identity matching if this host ever serves several devices.
+    if tunnels != {}:
+        return False
+    # Restart=always brings tunneld back; this loopback endpoint is already
+    # open to every local user, so the collector gains no privilege.
+    with suppress(OSError):  # The daemon may exit before it finishes replying.
+        urlopen(f"{_TUNNELD_URL}/shutdown", timeout=2).close()
+    return True
+
+
 def _syslog_event(record: dict[str, Any]) -> tuple[str, bool] | None:
     process = Path(str(record.get("filename", ""))).name
     message = str(record.get("message", ""))
@@ -412,7 +464,7 @@ async def _dvt_session(
         if item is not rsd:
             await item.close()
     if rsd is None:
-        raise RuntimeError("configured Apple TV tunnel is unavailable")
+        raise TunnelUnavailable("configured Apple TV tunnel is unavailable")
 
     try:
         async with dvt_factory(rsd) as dvt:
@@ -442,20 +494,46 @@ async def _dvt_loop(
     reconnect_seconds: float,
     timeout_seconds: float,
     session: Any = _dvt_session,
+    recover: Any = _recover_empty_tunneld,
+    recovery: TunneldRecovery | None = None,
 ) -> None:
     failures = 0
+    recovery = recovery or TunneldRecovery()
+
+    def emit_present(*args: Any) -> None:
+        recovery.present()
+        emit(*args)
+
     while not stop_event.is_set():
         started_at = time.monotonic()
         try:
             await session(
                 udid,
-                emit,
+                emit_present,
                 poll_seconds,
                 timeout_seconds,
                 stop_event=stop_event,
             )
+        except TunnelUnavailable as error:
+            logging.warning("DVT foreground poll failed: %s", error)
+            now = time.monotonic()
+            if recovery.due(now):
+                restarted = False
+                try:
+                    restarted = await asyncio.to_thread(recover)
+                except Exception as recover_error:
+                    logging.warning("tunneld_recovery failed: %s", recover_error)
+                if restarted:
+                    recovery.requested(now)
+                    logging.warning(
+                        "tunneld_recovery requested restart attempt=%d",
+                        recovery.attempts,
+                    )
+                else:
+                    recovery.interrupt()
         except Exception as error:
             logging.warning("DVT foreground poll failed: %s", error)
+            recovery.interrupt()
         outage()
         if stop_event.is_set():
             return

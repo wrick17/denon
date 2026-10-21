@@ -9,17 +9,21 @@ from datetime import datetime, timedelta, timezone
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
+from tools.appletv_foreground import collector
 from tools.appletv_foreground.collector import (
     Config,
     DvtSettleGuard,
     ForegroundState,
     ForegroundTracker,
+    TunneldRecovery,
+    TunnelUnavailable,
     _VALUE_TEMPLATE,
     _clear_payload,
     _dvt_loop,
     _dvt_session,
     _next_failure_count,
     _reconnect_delay,
+    _recover_empty_tunneld,
     _snapshot_foreground,
     _source_datetime,
     _source_is_authoritative,
@@ -559,6 +563,168 @@ class ForegroundTrackerTest(unittest.TestCase):
             self.assertEqual(outages, 2)
 
         asyncio.run(run())
+
+    def test_empty_tunneld_recovery_is_debounced_and_backs_off(self) -> None:
+        recovery = TunneldRecovery(60.0)
+        self.assertFalse(recovery.due(0.0))
+        self.assertFalse(recovery.due(59.0))
+        self.assertTrue(recovery.due(60.0))
+        recovery.requested(60.0)
+        self.assertFalse(recovery.due(61.0))
+        self.assertFalse(recovery.due(179.0))
+        self.assertTrue(recovery.due(180.0))
+        recovery.requested(180.0)
+        self.assertFalse(recovery.due(419.0))
+        self.assertTrue(recovery.due(420.0))
+        recovery.present()
+        self.assertFalse(recovery.due(500.0))
+        self.assertTrue(recovery.due(560.0))
+
+    def test_dvt_loop_recovers_only_a_device_missing_from_tunneld(self) -> None:
+        async def run() -> None:
+            stop = threading.Event()
+            calls = 0
+            recovered: list[str] = []
+
+            async def session(
+                _udid, emit, _interval, _timeout, *, stop_event
+            ):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise TunnelUnavailable("missing")
+                if calls == 2:
+                    raise ConnectionError("transient")
+                if calls == 3:
+                    emit("com.netflix.Netflix", datetime.now(timezone.utc))
+                    raise TunnelUnavailable("missing")
+                stop_event.set()
+
+            def recover() -> bool:
+                recovered.append("target")
+                return True
+
+            await _dvt_loop(
+                "target",
+                lambda *_args: None,
+                lambda: None,
+                stop,
+                0.5,
+                0,
+                3,
+                session=session,
+                recover=recover,
+                recovery=TunneldRecovery(0.0),
+            )
+            self.assertEqual(calls, 4)
+            self.assertEqual(recovered, ["target", "target"])
+
+        asyncio.run(run())
+
+    def test_dvt_loop_requires_continuous_absence_and_keeps_backoff(
+        self,
+    ) -> None:
+        missing = TunnelUnavailable("missing")
+        steps = [
+            (0, missing),
+            (5, ConnectionError("unusable")),
+            (15, ConnectionError("unusable")),
+            (35, ConnectionError("unusable")),
+            (65, missing),  # 65s since first absence, but interrupted.
+            (125, missing),  # Precheck: daemon unreachable.
+            (130, missing),
+            (190, missing),  # Precheck: device listed or listing malformed.
+            (195, missing),
+            (255, missing),  # Restart requested; next allowed at 375.
+            (265, ConnectionError("unusable")),
+            (275, missing),
+            (335, missing),  # Continuous again, but still backing off.
+            (375, missing),
+        ]
+        now = 0.0
+        outcomes = iter([OSError("unreachable"), False, True, True])
+        recovered: list[float] = []
+
+        async def session(_udid, _emit, _interval, _timeout, *, stop_event):
+            nonlocal now
+            if not steps:
+                stop_event.set()
+                return
+            now, error = steps.pop(0)
+            raise error
+
+        def recover() -> bool:
+            recovered.append(now)
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with patch.object(
+            collector, "time", SimpleNamespace(monotonic=lambda: now)
+        ):
+            asyncio.run(
+                _dvt_loop(
+                    "target",
+                    lambda *_args: None,
+                    lambda: None,
+                    threading.Event(),
+                    0.5,
+                    0,
+                    3,
+                    session=session,
+                    recover=recover,
+                )
+            )
+        self.assertEqual(recovered, [125, 190, 255, 375])
+
+    def test_tunneld_restart_requires_a_reachable_daemon_without_the_device(
+        self,
+    ) -> None:
+        def opener(listing):
+            requests: list[str] = []
+
+            def urlopen(url: str, timeout: float):
+                requests.append(url)
+                self.assertLessEqual(timeout, 5)
+                response = Mock()
+                response.__enter__ = Mock(return_value=response)
+                response.__exit__ = Mock(return_value=False)
+                response.read.return_value = json.dumps(listing).encode()
+                return response
+
+            return requests, urlopen
+
+        requests, urlopen = opener({})
+        self.assertTrue(_recover_empty_tunneld(urlopen))
+        self.assertEqual(
+            requests,
+            ["http://127.0.0.1:49151/", "http://127.0.0.1:49151/shutdown"],
+        )
+        def dying_daemon(url: str, timeout: float):
+            if url.endswith("/shutdown"):
+                raise ConnectionResetError("daemon exited mid-response")
+            return urlopen(url, timeout)
+
+        self.assertTrue(_recover_empty_tunneld(dying_daemon))
+        # tunneld keys Wi-Fi tunnels by the pairing identifier, not the
+        # UniqueDeviceID the collector selects on, so any listing means a
+        # device may still be served.
+        live_schema = {
+            "0A1B2C3D-0000-4000-8000-00000000AAAA": [
+                {
+                    "tunnel-address": "fd00::1",
+                    "tunnel-port": 50000,
+                    "interface": "192.0.2.10",
+                    "auxiliary-metadata": {},
+                    "origin": None,
+                }
+            ]
+        }
+        for listing in (live_schema, {"target": []}, [], None):
+            requests, urlopen = opener(listing)
+            self.assertFalse(_recover_empty_tunneld(urlopen))
+            self.assertEqual(requests, ["http://127.0.0.1:49151/"])
 
     def test_dvt_request_start_time_cannot_overwrite_newer_lifecycle(self) -> None:
         async def run() -> None:

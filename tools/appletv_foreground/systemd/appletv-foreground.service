@@ -1,6 +1,6 @@
 [Unit]
 Description=Apple TV foreground app MQTT sensor
-Requires=appletv-tunneld.service
+Wants=appletv-tunneld.service
 After=appletv-tunneld.service network-online.target
 
 [Service]
