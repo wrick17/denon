@@ -52,6 +52,73 @@ Leave the values in `include/config.h` empty for guided Wi-Fi and receiver
 setup. The file is ignored by Git. Compile-time defaults are optional, but a
 populated file must never be committed.
 
+### Moving an older install to the update layout
+
+Firmware before November 21, 2026 used a single-app partition table
+(`huge_app.csv`). The current firmware uses `min_spiffs.csv`:
+
+| Partition | Offset | Size |
+|---|---|---|
+| `nvs` | `0x9000` | `0x5000` (unchanged) |
+| `otadata` | `0xe000` | `0x2000` |
+| `app0`, `app1` | `0x10000`, `0x1f0000` | `0x1e0000` each |
+| `coredump` | `0x3f0000` | `0x10000` |
+
+A partition table cannot change over Wi-Fi, so an older install needs one USB
+flash. `pio run -t upload` writes the bootloader, partition table,
+`boot_app0.bin` and the application in one pass. Do not erase flash: NVS holds
+the receiver bond, the app volume table, the Wi-Fi settings and the API token,
+and the write leaves it in place. Every later update goes over Wi-Fi.
+
+### Wi-Fi firmware updates
+
+1. Upload the image as a raw body with the device token:
+
+   ```sh
+   curl -X POST http://<ESP32_HOST>/api/firmware \
+     -H 'Authorization: Bearer <DEVICE_TOKEN>' \
+     -H 'Content-Type: application/octet-stream' \
+     --data-binary @.pio/build/esp32dev/firmware.bin
+   ```
+
+   The ESP32 returns `202`, closes its Bluetooth links and restarts into the
+   other slot.
+2. Wait until `GET /api/state` reports `ota_state` as `trial` and the new
+   `ota_slot`.
+3. Within 10 minutes of that boot, confirm the image from the home network with
+   the setup access point closed:
+
+   ```sh
+   curl -X POST http://<ESP32_HOST>/api/firmware/confirm \
+     -H 'Authorization: Bearer <DEVICE_TOKEN>'
+   ```
+
+   It returns `200 {"confirmed":true}`.
+
+Upload rules:
+
+- The bearer token is always required. The setup access point never authorizes
+  an upload.
+- The ESP32 answers before reading the body and closes the connection on
+  rejection: `401` for a missing token, `409` while the running image is still
+  unconfirmed, `413` for an image larger than the slot, `415` for multipart or
+  a body that is not an ESP32 application image, `408` after 120 seconds.
+- The boot slot changes only after the whole image is written and its checksum
+  and SHA-256 verify; a failed check returns `422` and keeps the running image.
+
+Confirmation and rollback:
+
+- Confirm returns `403` through the setup access point or while it runs, and
+  `409` when nothing awaits confirmation or the firmware self-check failed.
+- An image that is not confirmed within 10 minutes restarts. The bootloader
+  then boots the previous image. If the bootloader does not roll back, the
+  firmware counts trial boots in NVS and switches back itself after three.
+- `ota_last_result` in `GET /api/state` reports `ok`, `rolled_back`,
+  `fallback` or `fallback_failed`.
+- If the firmware self-check fails, the ESP32 serves only info, pairing, state,
+  logs, firmware upload, restart and coredump. Bluetooth, controls and
+  confirmation stay off, so a fixed image can still be installed.
+
 ## Guided setup
 
 ### 1. Connect the ESP32 to Wi-Fi
@@ -97,14 +164,8 @@ reason. Serial output records boot reset reason and disconnect/retry events.
 Counters and the last disconnect reason are volatile and reset on reboot;
 capture serial output before restarting a failed device when possible.
 
-The Bluetooth diagnostics build adds `bt_acl_connect_count`,
-`bt_acl_last_connect_status`, `bt_acl_last_connect_at_ms`,
-`bt_acl_last_disconnect_reason`, and `bt_acl_last_disconnect_at_ms` to
-`GET /api/state`. These volatile fields observe the saved receiver's GAP events
-without changing connection or volume behavior. A disconnect reason is retained
-only for a previously established link; failed retries do not replace it.
-Times are milliseconds since boot, and unobserved statuses/times are `null`.
-The production-base build was installed on October 2; see `ACCEPTANCE.md`.
+Bluetooth link and recovery fields are described in
+[Bluetooth link and recovery](#bluetooth-link-and-recovery).
 
 To change an installed device's preferred address, send the new `ip` to the
 protected local network endpoint. To return to DHCP, delete that configuration:
@@ -137,8 +198,10 @@ stored settings are ignored and the firmware falls back to DHCP.
 5. Return the receiver to **TV Audio**.
 
 After the first bond, the ESP32 reconnects to the control service without
-repeating pairing. Set **Bluetooth > Auto-Select** to **Off** so control does not
-switch the receiver to Bluetooth audio. Set **Bluetooth Standby** to **On** if
+repeating pairing; see
+[Bluetooth link and recovery](#bluetooth-link-and-recovery). Set
+**Bluetooth > Auto-Select** to **Off** so control does not switch the receiver
+to Bluetooth audio. Set **Bluetooth Standby** to **On** if
 the receiver should reconnect after a restart.
 
 ### 3. Install the Home Assistant integration
@@ -314,6 +377,61 @@ disk; changed snapshots are saved after a short delay.
 Open `http://denon-volume-<DEVICE_ID_PREFIX>.local/` to see the live connection
 state, current receiver volume, pairing controls, and the per-app volume table.
 
+### Bluetooth link and recovery
+
+The firmware drives the ESP-IDF Bluedroid SPP and GAP APIs directly. Bluetooth
+callbacks only copy events and received bytes into queues; the main loop makes
+every state change and connection call. Handshake, source and status requests
+go out one at a time from a bounded queue. A volume step is never queued: it is
+sent only when no write is in flight and the link is not congested, otherwise
+the restore or manual request retries from fresh receiver feedback.
+
+The ESP32 stays connectable but hidden, accepts a control link from the bonded
+receiver, and connects at once over an ACL link the receiver opens. Its own
+reconnect attempts follow this ladder:
+
+| Consecutive failures | Retry delay |
+|---|---|
+| 1 to 6 | 5 s |
+| 7 to 12 | 15 s |
+| 13 or more | 60 s |
+
+- An attempt with no result after 30 seconds counts as a failure.
+- After 10 minutes of failures the firmware restarts the Bluetooth stack, then
+  again every 30 minutes. Two attempts in a row with no response restart it at
+  once. None of this reboots the board.
+- A stack that fails to start is retried after 1 minute, doubling up to
+  10 minutes. HTTP and updates stay available meanwhile.
+- Every intentional restart closes the control and A2DP links, waits up to
+  2 seconds, then disables Bluedroid, so the receiver sees a normal disconnect.
+- A 60-second loop watchdog resets a hung main loop. If the board resets while
+  Bluetooth runs, the next boot waits 3 minutes before starting Bluetooth so
+  HTTP and updates are reachable first. A stack start that hangs for 45 seconds
+  or a failed stack teardown reboots into the same delay.
+
+`GET /api/state` reports the link and recovery state:
+
+| Field | Meaning |
+|---|---|
+| `bt_recovery_stage` | `connected`, `connecting`, `reconnecting`, `retrying`, `backoff`, `passive`, `idle`, `stack_starting` or `bluetooth_down` |
+| `bt_page_timeouts` | consecutive page timeouts (HCI status `260`) |
+| `bt_connect_failures` | consecutive failed attempts |
+| `bt_stack_restarts` | Bluetooth stack restarts since boot |
+| `bt_start_failures` | consecutive failed stack starts |
+| `bt_since_connected_ms` | time since the link was last up; `0` while connected, `null` if never connected this boot |
+| `bt_last_error` | last start or recovery error, such as `spp_init_timeout` or `recovery_mode` |
+| `bt_controller_enabled` | whether the Bluetooth controller runs |
+| `bt_event_drops`, `bt_rx_drops` | queue overflows; a lost event drops and reconnects the link |
+| `reset_reason` | ESP-IDF reset reason of this boot |
+| `ota_slot`, `ota_state`, `ota_trial_boots`, `ota_last_result` | running slot and update state |
+
+The passive diagnostics fields `bt_acl_connect_count`,
+`bt_acl_last_connect_status`, `bt_acl_last_connect_at_ms`,
+`bt_acl_last_disconnect_reason`, and `bt_acl_last_disconnect_at_ms` remain. A
+disconnect reason is kept only for a previously established link; failed
+attempts do not replace it. Times are milliseconds since boot, and unobserved
+values are `null`. All of these counters reset on reboot.
+
 ### Apple TV app identity and ownership limitations
 
 The official [Home Assistant Apple TV
@@ -338,8 +456,9 @@ Discovery and status:
 - `GET /api/info` returns the product, API version, generated device ID, name,
   hostname, and pairing state.
 - `GET /api/state` returns Wi-Fi, receiver, Bluetooth, volume, active app,
-  restore state, mute state and lock, target generation, and `network_mode`
-  (`dhcp` or `static`).
+  restore state, mute state and lock, target generation, `network_mode`
+  (`dhcp` or `static`), and the Bluetooth recovery and update fields listed in
+  [Bluetooth link and recovery](#bluetooth-link-and-recovery).
 - `GET /api/apps` returns the bounded per-app volume table plus current app,
   restore state, mute state, and lock.
 - `GET /api/backup` returns a versioned app-volume snapshot and `ETag`. It
@@ -395,6 +514,24 @@ Receiver and provisioning controls:
   subnet, and DNS settings, then returns `202` and restarts.
 - `DELETE /api/network` clears only fixed and pending network settings, returns
   `202`, and restarts using DHCP.
+
+Maintenance, all with `Authorization: Bearer <DEVICE_TOKEN>` and never
+authorized by the setup access point:
+
+- `POST /api/firmware` and `POST /api/firmware/confirm` install and confirm an
+  update; see [Wi-Fi firmware updates](#wi-fi-firmware-updates).
+- `POST /api/restart` with form field `mode=clean` closes the Bluetooth links
+  first; `mode=abrupt` restarts at once to simulate a crash. Both return `202`.
+- `GET /api/coredump` streams the stored crash dump as `coredump.bin`, or
+  returns `404` when none is stored. It is the raw ESP-IDF flash dump; decode
+  it against the ELF of the firmware that crashed:
+
+  ```sh
+  esp-coredump info_corefile --core coredump.bin --core-format raw \
+    <FIRMWARE_ELF>
+  ```
+
+- `DELETE /api/coredump` erases the stored dump and returns `204`.
 
 Network-setting writes are transactional across Wi-Fi credentials, static
 address, gateway, subnet, DNS, and a pending preferred address. Every write and
@@ -452,18 +589,13 @@ authoritative pass/fail rows are in `ACCEPTANCE.md`.
 For unattended fault history, [rolling server logs](tools/rolling_logs/README.md)
 documents the read-only 72-hour journal, container, MQTT and ESP32 archive.
 
-If the ESP32 is reachable over Wi-Fi but Bluetooth remains disconnected after
-a full power cycle, briefly put the receiver in pairing mode by holding the
-remote's Bluetooth button for three seconds. In the September 26 tests this
-restored the existing bond without forgetting or re-pairing the device; return
-to TV Audio afterward. Automatic Bluetooth reconnection after power cycling
-remains unreliable on the tested receiver. See `ACCEPTANCE.md`.
-
-On October 2, a full receiver mains restart restored the existing connection
-after repeated Bluetooth page timeouts. A subsequent ESP32-only power cycle
-reconnected on TV Audio without pairing mode. This distinguishes mains restart
-from receiver standby, but does not establish the original dropout cause or a
-permanent fix. Capture diagnostics before either recovery action when possible.
+The tested AVR-X580BT stops accepting connections after its link to the ESP32
+ends, however the link ends: every page then fails with HCI status `260`, and
+firmware retries or a Bluetooth stack restart do not clear it. Turn the
+receiver off and on with its remote's power button, or cycle its mains power;
+the link returns within seconds. Holding the remote's Bluetooth button for
+three seconds (pairing mode) also restored the existing bond in September
+tests; return to TV Audio afterward. See `ACCEPTANCE.md`.
 
 - For a normal Home Assistant removal, call authenticated `POST /api/unpair`
   before deleting the integration entry. It clears only the API token and opens
@@ -479,6 +611,19 @@ permanent fix. Capture diagnostics before either recovery action when possible.
   the BOOT recovery above, then use **Forget receiver** and repeat receiver
   pairing within the new ten-minute window.
 
+### Link alert in Home Assistant
+
+`homeassistant/packages/denon_link_alert.yaml` polls `GET /api/state` every
+10 seconds and sends a phone notification after the link has been down, or the
+ESP32 unreachable, for 1 minute, and again when the link returns.
+
+1. Copy the file to `<HOME_ASSISTANT_CONFIG>/packages/` and enable packages in
+   `configuration.yaml` with `homeassistant: packages: !include_dir_named
+   packages`.
+2. Add `denon_state_url: http://<ESP32_HOST>/api/state` to `secrets.yaml`.
+3. Replace the `notify.` action in both automations with a notify service of
+   your installation, then restart Home Assistant.
+
 ## Tests
 
 Firmware build and protocol checks:
@@ -490,6 +635,12 @@ PLATFORMIO_CORE_DIR="$PWD/.pio-home" .venv/bin/pio run
 c++ -std=c++17 -Wall -Wextra -Werror -pedantic \
   test/volume_target_check.cpp -o /tmp/volume-target-check
 /tmp/volume-target-check
+c++ -std=c++17 -Wall -Wextra -Werror -pedantic \
+  test/recovery_policy_check.cpp -o /tmp/recovery-policy-check
+/tmp/recovery-policy-check
+c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Iinclude \
+  test/bt_diagnostics_check.cpp -o /tmp/bt-diagnostics-check
+/tmp/bt-diagnostics-check
 ```
 
 Repository privacy checks:

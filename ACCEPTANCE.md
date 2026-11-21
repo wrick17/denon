@@ -1,5 +1,79 @@
 # Physical end-to-end acceptance
 
+## Event-driven Bluetooth firmware and Wi-Fi updates · November 21, 2026
+
+### Diagnosis
+
+The Alfred log archive for November 18–21 shows 14 boots.
+
+- 9 were PANIC resets.
+- The other 5 were power-on resets from a temporary USB debug connection to a
+  sleeping laptop.
+- The flash coredump, decoded against the deployed ELF, shows `BTC_TASK` at
+  `pc=0x20000000` while the `denon_connect` task waited in
+  `BluetoothSerial::connect`.
+- No established-link disconnect was recorded. One connected boot held the
+  link for about 29 hours until a reset.
+
+### Firmware
+
+- Built on the deployed base: `0d06c30` plus the network-recovery, passive
+  Bluetooth diagnostics and network-log overlays. The undeployed `59e1144`
+  controller candidate is reverted on master.
+- It replaces BluetoothSerial with event-driven Bluedroid SPP and adds the
+  reconnect ladder, clean shutdown, Wi-Fi updates with trial boot and
+  rollback, the restart and coredump endpoints, and the loop watchdog.
+  `README.md` describes the behavior.
+- Two independent review rounds and a narrow re-check ran. All blocking
+  findings were fixed before flashing.
+- Deployed `firmware.bin` SHA-256:
+  `fdad54a612a19537a65d2a8a1e6f96655f9d78f50247ecb4f010f2745da1ebf3`. Local
+  rebuilds produce a different hash because the image embeds build metadata.
+
+### Installation
+
+- One USB write of the bootloader, partition table, `boot_app0` and
+  application, without erase, at 11:57 IST.
+- NVS was preserved. All 16 saved app rows matched the backup before and after.
+- A Wi-Fi update of the same image to `app1` booted in trial state, and the
+  authenticated confirm reported it confirmed.
+- The coredump download returned `200`.
+- Known defect: the `202` reply to `POST /api/firmware` carried a stale
+  `Content-Length` from the preceding coredump response. The upload itself
+  succeeded.
+
+### Receiver behavior
+
+- After a receiver power cycle, the link connected within seconds and the
+  firmware restored the Home app's saved volume.
+- After a clean restart (`POST /api/restart` with `mode=clean`), the receiver
+  answered every page with HCI page timeout `260` for 15 minutes.
+- After an abrupt restart, with the first page about 3 seconds after the drop,
+  it did the same for more than 5 minutes.
+- The Bluetooth stack restart at about 10 minutes did not help. A page from a
+  Mac also failed.
+- Turning the receiver off and on with its remote's power button, or a mains
+  power cycle, restored the connection within seconds each time.
+
+Conclusion: the AVR-X580BT stops accepting connections after its link to the
+controller ends, however the link ends, and firmware cannot clear that state.
+The new firmware removes the crash-driven drops, so the ESP32 now restarts only
+for updates.
+
+The Home Assistant link-alert package is deployed, and delivery to the iPhone
+is confirmed.
+
+### Open
+
+- 14-day unattended check on the UPS adapter, started November 21.
+- Automatic receiver reset. Planned: a smart-plug power cycle from Home
+  Assistant, because the receiver powers itself back on after a power cut.
+- Fix for the stale `Content-Length` reply in the next Wi-Fi update.
+
+Earlier sections that say "Do not flash a HEAD build" or describe HEAD as
+containing unaccepted controller changes are superseded: master no longer
+contains those changes.
+
 ## Rolling diagnostics archive · October 2, 2026
 
 The server now runs `denon-logs.service` with a private persistent SQLite archive
