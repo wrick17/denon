@@ -1,0 +1,66 @@
+# Home Assistant package: phone alert when the ESP32 loses control of the Denon.
+# Install: copy to <HA config>/packages/ and add to configuration.yaml:
+#   homeassistant:
+#     packages: !include_dir_named packages
+# Set denon_state_url in secrets.yaml to the ESP32's /api/state URL.
+# Replace notify.notify with your phone's notify service (notify.mobile_app_<device>).
+
+rest:
+  - resource: !secret denon_state_url
+    scan_interval: 10
+    timeout: 5
+    binary_sensor:
+      - name: Denon Bluetooth link
+        unique_id: denon_app_volume_bluetooth_link
+        device_class: connectivity
+        value_template: "{{ value_json.connected | default(false) }}"
+
+automation:
+  - id: denon_link_alert_lost
+    alias: Denon link lost alert
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.denon_bluetooth_link
+        to: ["off", "unavailable"]
+        for: "00:01:00"
+      # A link that is already down when Home Assistant starts has no state change.
+      - trigger: homeassistant
+        event: start
+        id: start
+    actions:
+      - if:
+          - condition: trigger
+            id: start
+        then:
+          - delay: "00:01:00"
+          - condition: state
+            entity_id: binary_sensor.denon_bluetooth_link
+            state: ["off", "unavailable"]
+      - action: notify.notify
+        data:
+          title: Denon volume control lost
+          message: >-
+            {% if is_state('binary_sensor.denon_bluetooth_link', 'unavailable') %}The ESP32 has not
+            answered on the network for 1 minute.{% else %}The ESP32 has had no
+            Bluetooth link to the Denon for 1 minute. If it does not reconnect,
+            restart the Denon.{% endif %}
+
+  - id: denon_link_alert_restored
+    alias: Denon link restored alert
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.denon_bluetooth_link
+        from: ["off", "unavailable"]
+        to: "on"
+    conditions:
+      # Only after an outage long enough to have sent the lost alert.
+      - condition: template
+        value_template: >-
+          {{ (trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds() >= 60 }}
+    actions:
+      - action: notify.notify
+        data:
+          title: Denon volume control restored
+          message: The ESP32 is connected to the Denon again.

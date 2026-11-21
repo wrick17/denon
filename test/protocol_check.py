@@ -81,7 +81,10 @@ assert "escaped += c;" not in source
 assert '<meta charset=utf-8>' in source
 assert 'text/html; charset=utf-8' in source
 assert "ESP_BT_IO_CAP_IN" not in source
-assert "address, 2, ESP_SPP_SEC_ENCRYPT | ESP_SPP_SEC_AUTHENTICATE" in source
+assert "constexpr uint8_t kDenonSppChannel = 2;" in source
+assert "ESP_SPP_ROLE_MASTER, kDenonSppChannel, denonMac" in source
+assert "esp_spp_connect(ESP_SPP_SEC_ENCRYPT | ESP_SPP_SEC_AUTHENTICATE," in source
+assert "BluetoothSerial" not in source and "waitForConnect" not in source
 assert "#include <esp_a2dp_api.h>" in source
 assert "esp_a2d_source_init()" in source
 assert "esp_a2d_source_connect(denonMac)" in source
@@ -91,8 +94,8 @@ assert "constexpr uint8_t kControlHandshake[] = {0x41, 0x54, 0x07, 0x25," in sou
 assert "0x01, 0x20, 0xDF};" in source
 assert "constexpr uint8_t kGetSources[] = {0x41, 0x54, 0x00, 0x04, 0x00, 0x00};" in source
 assert "constexpr uint8_t kGetStatus[] = {0x41, 0x54, 0x00, 0x06, 0x00, 0x00};" in source
-maintain = source[source.index("void maintainDenon()") : source.index("void readDenon()")]
-assert maintain.index("serialBt.connected()") < maintain.index("if (!a2dpConnected)")
+maintain = source[source.index("void noteDenonDisconnected(") : source.index("void readDenon()")]
+assert maintain.index("const bool connected = sppOpen;") < maintain.index("if (!a2dpConnected)")
 assert "startA2dpConnect();" in maintain
 bonded_reconnect = maintain[
     maintain.index("if (denonBonded)") : maintain.index("if (!a2dpConnected)")
@@ -112,7 +115,7 @@ assert session_init.index("sendDenon(kControlHandshake") < session_init.index(
 ) < session_init.index("sendDenon(kGetStatus")
 assert "if (!sessionInitialized)" in maintain
 assert maintain.count("sessionInitialized = false;") == 2
-assert maintain.count("sessionInitialized = true;") == 1
+assert maintain.count("sessionInitialized =\n            sendDenon(kControlHandshake") == 1
 assert "nextStatusAt = now + 300;" in maintain
 parser = source[source.index("bool parseVolumePacket(") : source.index("bool protocolSelfCheck()")]
 assert "length != 9" in parser
@@ -128,30 +131,38 @@ assert "parseVolumePacket(buffer + i, 9, raw)" in reader
 assert "parseMutePacket(buffer + i, 7, muted)" in reader
 assert "Mute frame:" not in reader
 assert reader.index("observeMute(muted);") < reader.index("observeVolume(raw);")
-assert "serialBt.onConfirmRequest(confirmDenonPairing);" in source
-confirm = source[source.index("void confirmDenonPairing(") : source.index("int32_t provideSilentAudio(")]
+assert "confirmDenonPairing(e.address, e.value);" in source
+confirm = source[source.index("void confirmDenonPairing(") : source.index("bool aclStatusSucceeded(")]
 assert "a2dpConnecting" in confirm
 assert "forgetInProgress" in confirm
-assert "esp_bt_gap_ssp_confirm_reply(denonMac, true)" in confirm
+assert "isDenonAddress(address)" in confirm
+assert "esp_bt_gap_ssp_confirm_reply(address, true)" in confirm
 assert "serialBt.confirmReply" not in confirm
-a2dp_event = source[source.index("void a2dpEvent(") : source.index("bool startA2dp()")]
-assert "isDenonAddress(param->conn_stat.remote_bda)" in a2dp_event
-assert "esp_a2d_source_disconnect(param->conn_stat.remote_bda)" in a2dp_event
+a2dp_event = source[source.index("void handleA2dpConnection(") : source.index("void addDiscoveredDevice(")]
+assert "isDenonAddress(e.address)" in a2dp_event
+assert "esp_a2d_source_disconnect(e.address)" in a2dp_event
 assert "pairingTimedOut = !forgetInProgress && a2dpConnecting;" in a2dp_event
-a2dp_start = source[source.index("void startA2dpConnect()") : source.index("void connectDenonTask(")]
+a2dp_start = source[source.index("void startA2dpConnect()") : source.index("void startDenonConnect()")]
 assert "connectInProgress" in a2dp_start
 assert "forgetInProgress" in a2dp_start
 assert "denonBonded" in a2dp_start
-spp_task = source[source.index("void connectDenonTask(") : source.index("void maintainDenon()")]
+spp_task = source[source.index("void startDenonConnect()") : source.index("void maintainDenon()")]
 assert "(!denonBonded && !a2dpConnected)" in spp_task
-assert spp_task.count("forgetInProgress") >= 3
+assert "forgetInProgress" in spp_task
+spp_accept = source[source.index("void acceptSppLink(") : source.index("void handleSppClose(")]
+assert "forgetInProgress" in spp_accept
+assert "(denonBonded || (!incoming && a2dpConnected))" in spp_accept
 assert r'\"receiver_bonded\":' in source
 assert "s.receiver_bonded?'Retry connection':'Retry pairing'" in source
 assert "const bool pairing = !denonBonded && a2dpConnecting;" in source
 setup = source[source.index("void setup()") : source.index("void loop()")]
-assert setup.index('serialBt.begin("Denon ESP32", true)') < setup.index(
-    "refreshDenonBondState()"
+bt_start = source[source.index("const char *btStartup()") : source.index("void btLifecycleTask(")]
+assert bt_start.index("esp_bt_controller_init(&config) != ESP_OK") < bt_start.index(
+    "esp_bluedroid_init() != ESP_OK"
 )
+assert "ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE" in bt_start
+assert setup.index("setupWeb(selfCheckPassed);") < setup.index('requestBtLifecycle(false, "boot")')
+assert setup.index("startOtaGuard();") < setup.index("networkSelfCheck()")
 assert '"confirm_on_denon"' in source
 assert r'\"pairing_number\":' in source
 assert '"%06lu"' in source
@@ -163,7 +174,7 @@ assert 'server.on("/api/denon/reconnect", HTTP_POST, reconnectDenon);' in source
 reconnect = source[source.index("void reconnectDenon()") : source.index("void discoverDenon()")]
 assert "!hasDenonMac" in reconnect
 assert "connectInProgress" in reconnect
-assert "serialBt.connected()" in reconnect
+assert "sppOpen" in reconnect
 assert "startDenonConnect();" in reconnect
 assert "startA2dpConnect();" in reconnect
 assert 'server.send(202, "application/json", "{\\\"connecting\\\":true}");' in reconnect
@@ -285,13 +296,13 @@ for runtime_value in ("WiFi.gatewayIP()", "WiFi.subnetMask()", "WiFi.dnsIP(0)"):
     assert runtime_value in network_save
 assert "validStaticNetwork(preferred, gateway, subnet, dns)" in network_save
 assert "persistStaticNetwork(preferred, gateway, subnet, dns)" in network_save
-network_clear = source[source.index("void clearNetwork()") : source.index("void setupWeb()")]
+network_clear = source[source.index("void clearNetwork()") : source.index("void setupWeb(bool full)")]
 assert "requireProvisioningAuthorization()" in network_clear
 assert "if (!clearStaticNetworkStorage())" in network_clear
 assert "previous settings restored" in network_clear
 assert 'constexpr char kMdnsService[] = "denon-volume";' in source
 assert 'MDNS.addServiceTxt(kMdnsService, "tcp", "id", deviceId.c_str());' in source
-web = source[source.index("void setupWeb()") : source.index("void setup()")]
+web = source[source.index("void setupWeb(bool full)") : source.index("void setup()")]
 for route in (
     "/api/info",
     "/api/pair",
@@ -299,6 +310,8 @@ for route in (
     "/api/apps",
     "/api/backup",
     "/api/network",
+    "/api/firmware/confirm",
+    "/api/restart",
 ):
     assert f'server.on("{route}"' in web
 assert r'\"network_mode\":' in source
@@ -307,6 +320,20 @@ assert (
     in web
 )
 assert "server.collectHeaders(headers, 4);" in web
+assert "server.addHandler(new FirmwareHandler());" in web
+assert 'server.on("/api/firmware/confirm", HTTP_POST, confirmFirmware);' in web
+firmware = source[source.index("void receiveFirmware()") : source.index("class FirmwareHandler")]
+assert "hasAppAuthorization()" in firmware and "currentRequestUsesSetupAp" not in firmware
+assert firmware.index("hasAppAuthorization()") < firmware.index("Update.begin(")
+assert firmware.index("persistOtaTrial(") < firmware.index("Update.end()")
+confirm_fw = source[source.index("void confirmFirmware()") : source.index("void rejectFirmware(")]
+assert "requireBackupAuthorization()" in confirm_fw and "currentRequestUsesStation()" in confirm_fw
+coredump = source[source.index("void sendCoredump()") : source.index("void restartApi()")]
+assert coredump.count("requireBackupAuthorization()") == 2
+assert 'server.on("/api/coredump", HTTP_GET, sendCoredump);' in web
+assert 'server.on("/api/coredump", HTTP_DELETE, eraseCoredump);' in web
+restart_api = source[source.index("void restartApi()") : source.index("void setupWeb(bool full)")]
+assert "hasAppAuthorization()" in restart_api
 backup = source[source.index("bool appTableEmpty()") : source.index("void sendInfo()")]
 assert "hasAppAuthorization()" in backup
 assert "requireProvisioningAuthorization()" not in backup
@@ -550,7 +577,7 @@ maintain_restore = volume_restore[
     volume_restore.index("void maintainVolumeRestore()") :
 ]
 assert maintain_restore.index(
-    "!restoreSessionArmed || !serialBt.connected() || !sessionInitialized"
+    "!restoreSessionArmed || !sppOpen || !sessionInitialized"
 ) < maintain_restore.index(
     "timeReached(now, restoreDeadlineAt)"
 )
@@ -589,9 +616,9 @@ automatic_unmute = maintain_restore[
     maintain_restore.index("if (restoreAutomaticMuteCycle && !currentPlaybackIdleFresh")
 ]
 assert automatic_unmute.index("armAutomaticRemuteRecovery(now)") < (
-    automatic_unmute.index("sendDenon(command, length)")
+    automatic_unmute.index("sendDenonStep(command, length)")
 )
-assert automatic_unmute.index("sendDenon(command, length)") < (
+assert automatic_unmute.index("sendDenonStep(command, length)") < (
     automatic_unmute.index("muteStateKnown = false;")
 )
 assert "kMuteOff" not in source
@@ -695,10 +722,10 @@ assert wait_burst_send.index("volumeRapidExtensionAllowed(") < (
     wait_burst_send.index("restoreBurstStartRaw = restoreObservedRaw;")
 )
 assert wait_burst_send.index("restoreBurstStartRaw = restoreObservedRaw;") < (
-    wait_burst_send.index("sendDenon(command, length)")
+    wait_burst_send.index("sendDenonStep(command, length)")
 )
 assert wait_burst_send.index("restoreBurstExtensionPending = false;") < (
-    wait_burst_send.index("sendDenon(command, length)")
+    wait_burst_send.index("sendDenonStep(command, length)")
 )
 settling = maintain_restore[
     maintain_restore.index("if (restorePhase == VolumeTargetPhase::settling)") :
@@ -724,7 +751,7 @@ assert "restoreBurstClicksPlanned = static_cast<uint8_t>(rapidClicks);" in volum
 assert "restoreCoarseEnabled = false;" in volume_restore
 assert "restoreCorrectiveReversalUsed" in volume_restore
 assert "corrective_reversal_exceeded" in volume_restore
-assert "if (restoreTargetRaw < 0) sendDenon(kGetStatus" in maintain
+assert "if (sessionInitialized && restoreTargetRaw < 0) {\n        sendDenon(kGetStatus" in maintain
 assert "volume_target_id" in source
 assert "target_id" in source
 assert "s.volume_target_id!==targetRequest.id" in source
@@ -753,9 +780,9 @@ for handler in (send_volume, send_target):
     assert handler.index("restoreTargetRaw >= 0") < handler.index("server.send(409")
     assert "Volume target is already in progress" in handler
     assert "automaticRemuteRequired ||" in handler
-assert send_volume.index("server.send(409") < send_volume.index("sendDenon(")
+assert send_volume.index("server.send(409") < send_volume.index("sendDenonStep(")
 assert send_target.index("server.send(409") < send_target.index("setVolume(")
-assert send_volume.index("server.send(423") < send_volume.index("sendDenon(")
+assert send_volume.index("server.send(423") < send_volume.index("sendDenonStep(")
 assert send_volume.index("server.send(423") < send_volume.index(
     "acceptManualVolumeFeedback(direction);"
 )
@@ -763,7 +790,7 @@ assert send_target.index("server.send(423") < send_target.index(
     "acceptManualVolumeFeedback(volumeDirection(volumeRaw, targetRaw));"
 )
 assert send_target.index("server.send(423") < send_target.index("setVolume(")
-assert send_volume.index("sendDenon(") < send_volume.index(
+assert send_volume.index("sendDenonStep(") < send_volume.index(
     "acceptManualVolumeFeedback(direction);"
 )
 assert (

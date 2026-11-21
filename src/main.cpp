@@ -1,20 +1,36 @@
 #include <Arduino.h>
-#include <BluetoothSerial.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
+#include <esp32-hal-bt.h>
 #include <esp_a2dp_api.h>
+#include <esp_bt.h>
+#include <esp_bt_device.h>
+#include <esp_bt_main.h>
+#include <esp_core_dump.h>
+#include <esp_flash.h>
 #include <esp_gap_bt_api.h>
+#include <esp_ota_ops.h>
+#include <esp_spp_api.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
 #include <esp_wifi.h>
+#include <freertos/message_buffer.h>
+#include <freertos/queue.h>
 #include <atomic>
 
 #include "config.h"
 #include "bt_diagnostics.h"
 #include "network_logs.h"
+#include "recovery_policy.h"
 #include "volume_target.h"
+
+// Arduino marks a pending OTA image valid at boot by default; this firmware
+// confirms it only after the health check in maintainOtaGuard().
+extern "C" bool verifyRollbackLater() { return true; }
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error "Bluetooth Classic requires the original ESP32 and Bluedroid."
@@ -35,6 +51,23 @@ constexpr uint32_t kWifiReconnectMs = 30000;
 constexpr unsigned long kReconnectMs = 5000;
 constexpr unsigned long kStatusIntervalMs = 5000;
 constexpr unsigned long kBondRemovalTimeoutMs = 3000;
+constexpr uint8_t kDenonSppChannel = 2;
+constexpr unsigned long kBtAttemptTimeoutMs = 30000;
+constexpr unsigned long kBtWriteStallMs = 5000;
+constexpr size_t kBtTxQueueLength = 8;
+constexpr unsigned long kBtProfileStartMs = 10000;
+constexpr unsigned long kBtProfileWaitMs = 2000;
+constexpr unsigned long kA2dpTransitionTimeoutMs = 60000;
+constexpr unsigned long kSppServerRetryMs = 60000;
+constexpr size_t kBtRxChunkBytes = 128;
+constexpr unsigned long kFirmwareBodyTimeoutMs = 120000;
+constexpr uint32_t kBtLifecycleMarker = 0xB7C1F00D;
+constexpr unsigned long kCleanShutdownMs = 2000;
+constexpr uint32_t kLoopWatchdogSeconds = 60;
+constexpr size_t kMaxDiscovered = 20;
+constexpr size_t kBtEventQueueLength = 32;
+constexpr size_t kBtRxBufferBytes = 2048;
+constexpr char kBtDeviceName[] = "Denon ESP32";
 constexpr unsigned long kAppStableMs = 750;
 constexpr unsigned long kAppPersistDelayMs = 2000;
 constexpr unsigned long kPlaybackIdleFreshMs = 5000;
@@ -61,9 +94,11 @@ constexpr uint8_t kControlHandshake[] = {0x41, 0x54, 0x07, 0x25,
 constexpr uint8_t kGetSources[] = {0x41, 0x54, 0x00, 0x04, 0x00, 0x00};
 constexpr uint8_t kGetStatus[] = {0x41, 0x54, 0x00, 0x06, 0x00, 0x00};
 
-BluetoothSerial serialBt;
 DNSServer dnsServer;
 Preferences preferences;
+Preferences otaPreferences;  // "ota" namespace; opened before the self-checks
+// Set while the Bluetooth lifecycle task runs; survives panic/watchdog resets.
+RTC_NOINIT_ATTR uint32_t rtcBtLifecycleMarker;
 bool stationHttpClaimed = false;
 
 bool isSetupApIngress(bool apRunning, bool matchesAp, bool matchesStation) {
@@ -77,6 +112,9 @@ bool isStationIngress(bool connected, bool matchesStation, bool matchesAp) {
 class StationAwareWebServer : public WebServer {
  public:
   explicit StationAwareWebServer(int port) : WebServer(port) {}
+
+  // client() returns a copy; stopping a copy leaves the request socket open.
+  WiFiClient &requestClient() { return _currentClient; }
 
  protected:
   size_t _currentClientWrite(const char *buffer, size_t length) override {
@@ -224,6 +262,113 @@ unsigned long wifiStartedAt = 0;
 volatile unsigned long nextReconnectAt = 0;
 volatile unsigned long nextA2dpReconnectAt = 0;
 unsigned long nextStatusAt = 0;
+
+// Bluetooth runtime. Bluedroid callbacks only copy events into btEvents (and
+// received bytes into btRx) or set the atomics below; every state change
+// happens in the loop task. The bt_lifecycle task only starts/stops the stack
+// while the loop leaves Bluetooth alone (btLifecycleBusy).
+enum class BtEventType : uint8_t {
+  aclConnect,
+  aclDisconnect,
+  authComplete,
+  confirmRequest,
+  pinRequest,
+  discoveryResult,
+  discoveryState,
+  sppInit,
+  sppServerStart,
+  sppClientInit,
+  sppOpen,
+  sppServerOpen,
+  sppClose,
+  sppCongestion,
+  sppWrite,
+  a2dpProfile,
+  a2dpConnection,
+};
+
+struct BtEvent {
+  BtEventType type;
+  uint8_t generation;
+  uint8_t address[6];
+  int32_t status;
+  uint32_t handle;
+  uint32_t value;
+  uint32_t at;
+  uint32_t connection;  // SPP connection sequence, assigned in the callback
+  char name[33];
+};
+
+struct DiscoveredDevice {
+  uint8_t address[6];
+  char name[33];
+};
+
+// Each RX message is generation, handle, connection sequence, then the bytes.
+struct BtRxHeader {
+  uint8_t generation;
+  uint32_t handle;
+  uint32_t connection;
+} __attribute__((packed));
+
+// Control traffic only (handshake, sources, status, mute). Volume steps are
+// never queued; see sendDenonStep().
+struct BtTxCommand {
+  const uint8_t *data;
+  uint8_t length;
+};
+
+QueueHandle_t btEvents = nullptr;
+MessageBufferHandle_t btRx = nullptr;
+std::atomic<uint8_t> btGeneration{0};
+std::atomic<uint32_t> btEventDrops{0};
+std::atomic<uint32_t> btRxDrops{0};
+std::atomic<bool> btLifecycleBusy{false};
+std::atomic<const char *> btLifecycleError{nullptr};
+std::atomic<bool> sppUninitDone{false};
+std::atomic<bool> btTeardownFailed{false};
+std::atomic<bool> a2dpDeinitDone{false};
+bool btLifecycleResultPending = false;
+unsigned long btLifecycleStartedAt = 0;
+unsigned long btProfilesDeadline = 0;
+const char *btLastError = nullptr;
+bool sppReady = false;
+bool sppServerRunning = false;
+unsigned long sppServerRetryAt = 0;
+bool sppOpen = false;
+uint32_t sppHandle = 0;
+uint32_t sppConnection = 0;
+bool sppCongested = false;
+unsigned long sppTxProgressAt = 0;  // last submit, completion, or idle enqueue
+bool sppWriteInFlight = false;
+BtTxCommand sppTx[kBtTxQueueLength];
+size_t sppTxHead = 0;
+size_t sppTxCount = 0;
+size_t denonRxLength = 0;
+unsigned long a2dpTransitionAt = 0;
+uint32_t attemptHandle = 0;
+unsigned long attemptStartedAt = 0;
+bool attemptPageTimeout = false;
+BtLadder btLadder;
+uint32_t btStartFailures = 0;
+unsigned long nextStackRetryAt = 0;
+bool firmwareRestartPending = false;
+bool selfCheckPassed = false;
+uint32_t btEventDropsHandled = 0;
+bool discoveryActive = false;
+bool discoveryRunning = false;
+bool discoveryStarted = false;
+DiscoveredDevice discovered[kMaxDiscovered];
+size_t discoveredCount = 0;
+
+// OTA boot guard state for this boot.
+const char *otaBootState = "stable";
+String otaLastResult;
+uint8_t otaTrialBoots = 0;
+bool otaTrialActive = false;
+bool otaPendingVerify = false;
+
+void restartDevice(bool clean);
 
 const char kPage[] PROGMEM = R"HTML(
 <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
@@ -645,8 +790,7 @@ bool finishPendingStaticNetwork() {
     return false;
   }
   Serial.println("Preferred IP saved with DHCP network defaults; restarting");
-  delay(250);
-  ESP.restart();
+  restartDevice(true);
   return true;
 }
 
@@ -726,9 +870,53 @@ void maintainWifi() {
   }
 }
 
+void dropSppLink(const char *reason);
+
+// One SDK write in flight; the next starts on its completion or when
+// congestion clears. Commands are static constants, so pointers stay valid.
+void pumpDenonTx() {
+  const uint32_t now = millis();
+  if (!sppOpen || sppWriteInFlight || sppCongested || sppTxCount == 0) return;
+  const BtTxCommand command = sppTx[sppTxHead];
+  if (esp_spp_write(sppHandle, command.length, const_cast<uint8_t *>(command.data)) !=
+      ESP_OK) {
+    dropSppLink("write could not start");
+    return;
+  }
+  sppTxHead = (sppTxHead + 1) % kBtTxQueueLength;
+  --sppTxCount;
+  sppWriteInFlight = true;
+  sppTxProgressAt = now;
+}
+
+// Bounded and non-blocking: queues up to kBtTxQueueLength commands.
 bool sendDenon(const uint8_t *command, size_t length) {
-  if (!serialBt.connected()) return false;
-  return serialBt.write(command, length) == length;
+  if (!sppOpen || sppTxCount == kBtTxQueueLength) return false;
+  if (sppTxCount == 0 && !sppWriteInFlight) sppTxProgressAt = millis();
+  sppTx[(sppTxHead + sppTxCount) % kBtTxQueueLength] = {
+      command, static_cast<uint8_t>(length)};
+  ++sppTxCount;
+  pumpDenonTx();
+  return sppOpen;
+}
+
+// A volume step goes out in this pass or not at all: only with nothing
+// queued, nothing in flight, and no congestion. Callers retry from fresh
+// feedback on a later pass.
+bool denonStepReady() {
+  return sppOpen && !sppWriteInFlight && !sppCongested && sppTxCount == 0;
+}
+
+bool sendDenonStep(const uint8_t *command, size_t length) {
+  if (!denonStepReady()) return false;
+  if (esp_spp_write(sppHandle, static_cast<int>(length),
+                    const_cast<uint8_t *>(command)) != ESP_OK) {
+    dropSppLink("write could not start");
+    return false;
+  }
+  sppWriteInFlight = true;
+  sppTxProgressAt = millis();
+  return true;
 }
 
 void appStorageKey(uint8_t bank, size_t index, char key[7]) {
@@ -1452,7 +1640,7 @@ void observeVolume(uint8_t raw) {
 
 void maintainAutomaticRemute(unsigned long now) {
   if (!automaticRemuteRequired || restoreAutomaticMuteCycle ||
-      !serialBt.connected() || !sessionInitialized || !muteStateKnown) {
+      !sppOpen || !sessionInitialized || !muteStateKnown) {
     return;
   }
   if (!timeReached(now, automaticRemuteNotBefore)) return;
@@ -1470,7 +1658,7 @@ void maintainVolumeRestore() {
   maintainAutomaticRemute(now);
   if (automaticRemuteRequired && !restoreAutomaticMuteCycle) return;
   if (restoreTargetRaw < 0) return;
-  if (!restoreSessionArmed || !serialBt.connected() || !sessionInitialized) {
+  if (!restoreSessionArmed || !sppOpen || !sessionInitialized) {
     return;
   }
   if (timeReached(now, restoreDeadlineAt)) {
@@ -1512,12 +1700,13 @@ void maintainVolumeRestore() {
       failVolumeRestore("remute_journal_failed");
       return;
     }
+    if (!denonStepReady()) return;  // retry next pass
     const uint8_t *command = direction > 0 ? kVolumeUp : kVolumeDown;
     const size_t length = direction > 0 ? sizeof(kVolumeUp)
                                          : sizeof(kVolumeDown);
     const int rapidClicks = volumeRapidClickCount(
         abs(restoreTargetRaw - volumeRaw), 0, 0);
-    if (!sendDenon(command, length)) {
+    if (!sendDenonStep(command, length)) {
       failVolumeRestore("command_write_failed");
       return;
     }
@@ -1581,6 +1770,7 @@ void maintainVolumeRestore() {
         restoreCommandDirection > 0 ? kVolumeUp : kVolumeDown;
     const size_t length = restoreCommandDirection > 0 ? sizeof(kVolumeUp)
                                                        : sizeof(kVolumeDown);
+    if (!denonStepReady()) return;  // retry next pass
     if (sendExtension) {
       restoreBurstActive = true;
       restoreBurstStartRaw = restoreObservedRaw;
@@ -1588,7 +1778,7 @@ void maintainVolumeRestore() {
       restoreBurstClicksSent = 0;
       restoreBurstExtensionPending = false;
     }
-    if (!sendDenon(command, length)) {
+    if (!sendDenonStep(command, length)) {
       failVolumeRestore("command_write_failed");
       return;
     }
@@ -1672,6 +1862,7 @@ void maintainVolumeRestore() {
     failVolumeRestore("step_budget_exceeded");
     return;
   }
+  if (!denonStepReady()) return;  // retry next pass
   const uint8_t *command = direction > 0 ? kVolumeUp : kVolumeDown;
   const size_t length = direction > 0 ? sizeof(kVolumeUp) : sizeof(kVolumeDown);
   const int distanceRaw = abs(restoreTargetRaw - restoreObservedRaw);
@@ -1680,7 +1871,7 @@ void maintainVolumeRestore() {
           ? volumeRapidClickCount(distanceRaw, restoreBurstMeasuredDeltaRaw,
                                   restoreBurstMeasuredClicks)
           : 0;
-  if (sendDenon(command, length)) {
+  if (sendDenonStep(command, length)) {
     restoreCommandRaw = restoreObservedRaw;
     restoreCommandDirection = direction;
     ++restoreSteps;
@@ -1778,15 +1969,216 @@ bool isDenonAddress(const uint8_t address[6]) {
   return hasDenonMac && memcmp(address, denonMac, sizeof(denonMac)) == 0;
 }
 
-void confirmDenonPairing(uint32_t number) {
-  if (forgetInProgress || (!a2dpConnecting && !connectInProgress) ||
-      !hasDenonMac) {
-    if (hasDenonMac) esp_bt_gap_ssp_confirm_reply(denonMac, false);
+// ---- Bluedroid callbacks: they run in Bluetooth tasks, so they only copy
+// data into btEvents/btRx or set atomics. No logging or state changes here.
+
+void postBtEvent(BtEvent &event) {
+  event.generation = btGeneration.load(std::memory_order_relaxed);
+  event.at = millis();
+  if (!btEvents || xQueueSend(btEvents, &event, 0) != pdTRUE) {
+    btEventDrops.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void copyBtName(char output[33], const uint8_t *text, size_t length) {
+  if (length > 32) length = 32;
+  memcpy(output, text, length);
+  output[length] = '\0';
+}
+
+void gapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
+  BtEvent e{};
+  switch (event) {
+    case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
+      e.type = BtEventType::aclConnect;
+      memcpy(e.address, param->acl_conn_cmpl_stat.bda, sizeof(e.address));
+      e.status = param->acl_conn_cmpl_stat.stat;
+      e.handle = param->acl_conn_cmpl_stat.handle;
+      break;
+    case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
+      e.type = BtEventType::aclDisconnect;
+      memcpy(e.address, param->acl_disconn_cmpl_stat.bda, sizeof(e.address));
+      e.status = param->acl_disconn_cmpl_stat.reason;
+      e.handle = param->acl_disconn_cmpl_stat.handle;
+      break;
+    case ESP_BT_GAP_AUTH_CMPL_EVT:
+      e.type = BtEventType::authComplete;
+      memcpy(e.address, param->auth_cmpl.bda, sizeof(e.address));
+      e.status = param->auth_cmpl.stat;
+      break;
+    case ESP_BT_GAP_CFM_REQ_EVT:
+      e.type = BtEventType::confirmRequest;
+      memcpy(e.address, param->cfm_req.bda, sizeof(e.address));
+      e.value = param->cfm_req.num_val;
+      break;
+    case ESP_BT_GAP_PIN_REQ_EVT:
+      e.type = BtEventType::pinRequest;
+      memcpy(e.address, param->pin_req.bda, sizeof(e.address));
+      e.value = param->pin_req.min_16_digit;
+      break;
+    case ESP_BT_GAP_DISC_RES_EVT:
+      // Keep queue room for connection events; scan results are best effort.
+      if (!btEvents || uxQueueSpacesAvailable(btEvents) < 8) return;
+      e.type = BtEventType::discoveryResult;
+      memcpy(e.address, param->disc_res.bda, sizeof(e.address));
+      for (int i = 0; i < param->disc_res.num_prop; ++i) {
+        const esp_bt_gap_dev_prop_t &prop = param->disc_res.prop[i];
+        const uint8_t *value = static_cast<const uint8_t *>(prop.val);
+        if (prop.type == ESP_BT_GAP_DEV_PROP_BDNAME && prop.len > 0) {
+          copyBtName(e.name, value,
+                     strnlen(reinterpret_cast<const char *>(value), prop.len));
+        } else if (prop.type == ESP_BT_GAP_DEV_PROP_EIR && !e.name[0]) {
+          uint8_t length = 0;
+          uint8_t *eir = static_cast<uint8_t *>(prop.val);
+          const uint8_t *text = esp_bt_gap_resolve_eir_data(
+              eir, ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME, &length);
+          if (!text) {
+            text = esp_bt_gap_resolve_eir_data(
+                eir, ESP_BT_EIR_TYPE_SHORT_LOCAL_NAME, &length);
+          }
+          if (text) copyBtName(e.name, text, length);
+        }
+      }
+      break;
+    case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
+      e.type = BtEventType::discoveryState;
+      e.status = param->disc_st_chg.state;
+      break;
+    default:
+      return;
+  }
+  postBtEvent(e);
+}
+
+// Only the BTC task touches this table, so it needs no lock. Handles can be
+// reused within one stack generation; the sequence tells sessions apart.
+struct CallbackLink {
+  uint32_t handle;
+  uint32_t connection;
+};
+CallbackLink callbackLinks[4] = {};
+uint32_t callbackConnectionSeq = 0;
+
+uint32_t callbackConnection(uint32_t handle) {
+  for (const CallbackLink &link : callbackLinks) {
+    if (link.handle == handle && link.connection) return link.connection;
+  }
+  return 0;
+}
+
+uint32_t openCallbackConnection(uint32_t handle) {
+  CallbackLink *slot = &callbackLinks[0];
+  for (CallbackLink &link : callbackLinks) {
+    if (link.handle == handle || !link.connection) {
+      slot = &link;
+      break;
+    }
+  }
+  if (++callbackConnectionSeq == 0) ++callbackConnectionSeq;
+  *slot = {handle, callbackConnectionSeq};
+  return callbackConnectionSeq;
+}
+
+void sppCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
+  BtEvent e{};
+  switch (event) {
+    case ESP_SPP_DATA_IND_EVT: {
+      // Tag every chunk with its stack generation and connection handle so
+      // the loop parses only bytes of the accepted session.
+      uint8_t message[sizeof(BtRxHeader) + kBtRxChunkBytes];
+      const BtRxHeader header{btGeneration.load(std::memory_order_relaxed),
+                              param->data_ind.handle,
+                              callbackConnection(param->data_ind.handle)};
+      memcpy(message, &header, sizeof(header));
+      size_t remaining = param->data_ind.len;
+      const uint8_t *data = param->data_ind.data;
+      while (remaining) {
+        const size_t chunk = remaining < kBtRxChunkBytes ? remaining : kBtRxChunkBytes;
+        memcpy(message + sizeof(header), data, chunk);
+        if (!btRx || xMessageBufferSend(btRx, message, sizeof(header) + chunk, 0) == 0) {
+          btRxDrops.fetch_add(remaining, std::memory_order_relaxed);
+          break;
+        }
+        data += chunk;
+        remaining -= chunk;
+      }
+      return;
+    }
+    case ESP_SPP_UNINIT_EVT:
+      sppUninitDone.store(true, std::memory_order_release);
+      return;
+    case ESP_SPP_INIT_EVT:
+      e.type = BtEventType::sppInit;
+      e.status = param->init.status;
+      break;
+    case ESP_SPP_START_EVT:
+      e.type = BtEventType::sppServerStart;
+      e.status = param->start.status;
+      break;
+    case ESP_SPP_CL_INIT_EVT:
+      e.type = BtEventType::sppClientInit;
+      e.status = param->cl_init.status;
+      e.handle = param->cl_init.handle;
+      break;
+    case ESP_SPP_OPEN_EVT:
+      e.type = BtEventType::sppOpen;
+      e.status = param->open.status;
+      e.handle = param->open.handle;
+      if (e.status == ESP_SPP_SUCCESS) e.connection = openCallbackConnection(e.handle);
+      memcpy(e.address, param->open.rem_bda, sizeof(e.address));
+      break;
+    case ESP_SPP_SRV_OPEN_EVT:
+      e.type = BtEventType::sppServerOpen;
+      e.status = param->srv_open.status;
+      e.handle = param->srv_open.handle;
+      if (e.status == ESP_SPP_SUCCESS) e.connection = openCallbackConnection(e.handle);
+      memcpy(e.address, param->srv_open.rem_bda, sizeof(e.address));
+      break;
+    case ESP_SPP_CLOSE_EVT:
+      e.type = BtEventType::sppClose;
+      e.status = param->close.status;
+      e.handle = param->close.handle;
+      e.value = param->close.async;
+      e.connection = callbackConnection(e.handle);
+      for (CallbackLink &link : callbackLinks) {
+        if (link.handle == e.handle) link = {};
+      }
+      break;
+    case ESP_SPP_CONG_EVT:
+      e.type = BtEventType::sppCongestion;
+      e.handle = param->cong.handle;
+      e.connection = callbackConnection(e.handle);
+      e.value = param->cong.cong;
+      break;
+    case ESP_SPP_WRITE_EVT:
+      e.type = BtEventType::sppWrite;
+      e.status = param->write.status;
+      e.handle = param->write.handle;
+      e.connection = callbackConnection(e.handle);
+      e.value = param->write.cong;
+      break;
+    default:
+      return;
+  }
+  postBtEvent(e);
+}
+
+void a2dpCallback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
+  BtEvent e{};
+  if (event == ESP_A2D_PROF_STATE_EVT) {
+    if (param->a2d_prof_stat.init_state == ESP_A2D_DEINIT_SUCCESS) {
+      a2dpDeinitDone.store(true, std::memory_order_release);
+    }
+    e.type = BtEventType::a2dpProfile;
+    e.status = param->a2d_prof_stat.init_state;
+  } else if (event == ESP_A2D_CONNECTION_STATE_EVT) {
+    e.type = BtEventType::a2dpConnection;
+    e.status = param->conn_stat.state;
+    memcpy(e.address, param->conn_stat.remote_bda, sizeof(e.address));
+  } else {
     return;
   }
-  if (esp_bt_gap_ssp_confirm_reply(denonMac, true) != ESP_OK) return;
-  pairingNumber = number;
-  pairingNumberReady = true;
+  postBtEvent(e);
 }
 
 int32_t provideSilentAudio(uint8_t *data, int32_t length) {
@@ -1795,56 +2187,359 @@ int32_t provideSilentAudio(uint8_t *data, int32_t length) {
   return length;
 }
 
-void a2dpEvent(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
-  if (event == ESP_A2D_PROF_STATE_EVT) {
-    a2dpReady = param->a2d_prof_stat.init_state == ESP_A2D_INIT_SUCCESS;
-    if (a2dpReady) nextA2dpReconnectAt = 0;
-    return;
-  }
-  if (event != ESP_A2D_CONNECTION_STATE_EVT) return;
+// ---- Bluetooth lifecycle task: stack start/stop only, never on the loop ----
 
-  const bool target = isDenonAddress(param->conn_stat.remote_bda);
-  if (!target) {
-    if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTING ||
-        param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-      esp_a2d_source_disconnect(param->conn_stat.remote_bda);
+bool waitFlag(std::atomic<bool> &flag, unsigned long timeoutMs) {
+  const unsigned long started = millis();
+  while (!flag.load(std::memory_order_acquire)) {
+    if (millis() - started >= timeoutMs) return false;
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  return true;
+}
+
+// Every transition is checked; a failure stops here so nothing is reset
+// while a host callback could still run.
+const char *btTeardown() {
+  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) {
+    a2dpDeinitDone.store(false, std::memory_order_relaxed);
+    if (esp_a2d_source_deinit() == ESP_OK &&
+        !waitFlag(a2dpDeinitDone, kBtProfileWaitMs)) {
+      return "a2dp_deinit_timeout";
+    }
+    sppUninitDone.store(false, std::memory_order_relaxed);
+    if (esp_spp_deinit() == ESP_OK && !waitFlag(sppUninitDone, kBtProfileWaitMs)) {
+      return "spp_deinit_timeout";
+    }
+    if (esp_bluedroid_disable() != ESP_OK) return "bluedroid_disable_failed";
+  }
+  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_INITIALIZED &&
+      esp_bluedroid_deinit() != ESP_OK) {
+    return "bluedroid_deinit_failed";
+  }
+  if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_UNINITIALIZED) {
+    return "bluedroid_still_running";
+  }
+  if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED &&
+      esp_bt_controller_disable() != ESP_OK) {
+    return "controller_disable_failed";
+  }
+  if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED &&
+      esp_bt_controller_deinit() != ESP_OK) {
+    return "controller_deinit_failed";
+  }
+  return esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE
+             ? nullptr
+             : "controller_still_running";
+}
+
+const char *btStartup() {
+  esp_bt_controller_config_t config = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+  if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE &&
+      esp_bt_controller_init(&config) != ESP_OK) {
+    return "controller_init_failed";
+  }
+  if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED &&
+      esp_bt_controller_enable(static_cast<esp_bt_mode_t>(config.mode)) != ESP_OK) {
+    return "controller_enable_failed";
+  }
+  if (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED) {
+    return "controller_not_enabled";
+  }
+  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED &&
+      esp_bluedroid_init() != ESP_OK) {
+    return "bluedroid_init_failed";
+  }
+  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_INITIALIZED &&
+      esp_bluedroid_enable() != ESP_OK) {
+    return "bluedroid_enable_failed";
+  }
+  if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED) {
+    return "bluedroid_not_enabled";
+  }
+  if (esp_bt_gap_register_callback(gapCallback) != ESP_OK ||
+      esp_spp_register_callback(sppCallback) != ESP_OK ||
+      esp_spp_init(ESP_SPP_MODE_CB) != ESP_OK) {
+    return "spp_start_failed";
+  }
+  esp_bt_dev_set_device_name(kBtDeviceName);
+  esp_bt_pin_code_t pin;
+  memset(pin, '0', sizeof(pin));
+  esp_bt_gap_set_pin(ESP_BT_PIN_TYPE_FIXED, 4, pin);
+  esp_bt_io_cap_t ioCapability = ESP_BT_IO_CAP_IO;
+  esp_bt_gap_set_security_param(ESP_BT_SP_IOCAP_MODE, &ioCapability,
+                                sizeof(ioCapability));
+  // Same class of device as the previous Arduino Bluetooth serial build.
+  esp_bt_cod_t cod = {};
+  cod.major = 0b00001;
+  cod.minor = 0b000100;
+  cod.service = 0b00000010110;
+  esp_bt_gap_set_cod(cod, ESP_BT_INIT_COD);
+  // Connectable but hidden, so the bonded receiver can open the link to us.
+  if (esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE) != ESP_OK) {
+    return "scan_mode_failed";
+  }
+  if (esp_a2d_register_callback(a2dpCallback) != ESP_OK ||
+      esp_a2d_source_register_data_callback(provideSilentAudio) != ESP_OK ||
+      esp_a2d_source_init() != ESP_OK) {
+    return "a2dp_start_failed";
+  }
+  return nullptr;
+}
+
+void btLifecycleTask(void *restart) {
+  const char *error = restart ? btTeardown() : nullptr;
+  if (error) btTeardownFailed.store(true, std::memory_order_relaxed);
+  if (!error) {
+    // The old host is fully stopped: anything it queued is stale now.
+    btGeneration.fetch_add(1, std::memory_order_relaxed);
+    error = btStartup();
+  }
+  btLifecycleError.store(error, std::memory_order_relaxed);
+  btLifecycleBusy.store(false, std::memory_order_release);
+  vTaskDelete(nullptr);
+}
+
+// ---- Loop-side Bluetooth state machine ----
+
+void resetBtLinkState() {
+  sppReady = false;
+  sppServerRunning = false;
+  sppOpen = false;
+  sppHandle = 0;
+  sppCongested = false;
+  sppWriteInFlight = false;
+  sppTxCount = 0;
+  denonRxLength = 0;
+  attemptHandle = 0;
+  connectInProgress = false;
+  a2dpReady = false;
+  a2dpConnecting = false;
+  a2dpConnected = false;
+  a2dpDisconnecting = false;
+  discoveryRunning = false;
+  clearPairingNumber();
+}
+
+void requestBtLifecycle(bool restart, const char *reason) {
+  Serial.printf("Bluetooth %s (%s)\n", restart ? "stack restart" : "start", reason);
+  bluetoothReady = false;  // the loop stops calling Bluetooth APIs
+  if (sppOpen) btLadderDisconnected(btLadder, millis());
+  resetBtLinkState();
+  btTeardownFailed.store(false, std::memory_order_relaxed);
+  btLifecycleBusy.store(true, std::memory_order_release);
+  btLifecycleStartedAt = millis();
+  // Stays armed while Bluetooth runs; only a clean stop or an intentional
+  // restart clears it, so any Bluetooth-time crash defers the next start.
+  rtcBtLifecycleMarker = kBtLifecycleMarker;
+  if (xTaskCreatePinnedToCore(btLifecycleTask, "bt_lifecycle", 6144,
+                              restart ? reinterpret_cast<void *>(1) : nullptr, 1,
+                              nullptr, ARDUINO_RUNNING_CORE) != pdPASS) {
+    btLifecycleError.store("lifecycle_task_failed", std::memory_order_relaxed);
+    btLifecycleBusy.store(false, std::memory_order_release);
+  }
+  btLifecycleResultPending = true;
+}
+
+void failBtStart(const char *error) {
+  bluetoothReady = false;
+  btLastError = error;
+  ++btStartFailures;
+  nextStackRetryAt = millis() + btStartRetryDelayMs(btStartFailures);
+  Serial.printf("Bluetooth unavailable (%s); retry in %lus\n", error,
+                static_cast<unsigned long>(btStartRetryDelayMs(btStartFailures) / 1000));
+}
+
+bool refreshDenonBondState();
+
+void maintainBtLifecycle() {
+  const unsigned long now = millis();
+  if (btLifecycleBusy.load(std::memory_order_acquire)) {
+    if (now - btLifecycleStartedAt >= kBtLifecycleTimeoutMs) {
+      // The stack hung. The RTC marker stays set, so the next boot keeps
+      // Bluetooth off for a while and HTTP/OTA stays reachable.
+      Serial.println("Bluetooth lifecycle hung; rebooting into recovery");
+      delay(50);
+      esp_restart();
     }
     return;
   }
-  if (forgetInProgress &&
-      (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTING ||
-       param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED)) {
-    a2dpConnecting = false;
+  if (btLifecycleResultPending) {
+    btLifecycleResultPending = false;
+    const char *error = btLifecycleError.load(std::memory_order_relaxed);
+    if (btTeardownFailed.load(std::memory_order_relaxed)) {
+      // A half-stopped stack is not safe to reuse. Reboot with the marker
+      // still armed, so the next boot serves HTTP before Bluetooth.
+      Serial.printf("Bluetooth teardown failed (%s); rebooting into recovery\n", error);
+      delay(50);
+      esp_restart();
+    }
+    if (error) {
+      failBtStart(error);
+      return;
+    }
+    bluetoothReady = true;
+    btProfilesDeadline = now + kBtProfileStartMs;
+    nextReconnectAt = now + 1000;
+    if (!refreshDenonBondState()) failBtStart("bond_read_failed");
+    return;
+  }
+  if (!bluetoothReady && nextStackRetryAt != 0 && timeReached(now, nextStackRetryAt)) {
+    nextStackRetryAt = 0;
+    requestBtLifecycle(true, btLastError ? btLastError : "start");
+  }
+}
+
+void confirmDenonPairing(uint8_t address[6], uint32_t number) {
+  if (forgetInProgress || (!a2dpConnecting && !connectInProgress) ||
+      !isDenonAddress(address)) {
+    esp_bt_gap_ssp_confirm_reply(address, false);
+    return;
+  }
+  if (esp_bt_gap_ssp_confirm_reply(address, true) != ESP_OK) return;
+  pairingNumber = number;
+  pairingNumberReady = true;
+}
+
+bool aclStatusSucceeded(int status) {
+  return status == ESP_BT_STATUS_SUCCESS || status == ESP_BT_STATUS_HCI_SUCCESS;
+}
+
+void finishConnectAttempt(bool connected, BtFailure failure) {
+  const unsigned long now = millis();
+  connectInProgress = false;
+  attemptHandle = 0;
+  clearPairingNumber();
+  if (connected) {
+    btLadderConnected(btLadder, now);
+    Serial.println("Denon connected");
+    return;
+  }
+  btLadderFailure(btLadder, now, failure);
+  nextReconnectAt = now + btLadderRetryDelayMs(btLadder);
+  Serial.printf("Denon connection failed (%s; %lu consecutive, %lu page timeouts)\n",
+                failure == BtFailure::pageTimeout
+                    ? "page timeout"
+                    : (failure == BtFailure::noResponse ? "no response" : "error"),
+                static_cast<unsigned long>(btLadder.consecutiveFailures),
+                static_cast<unsigned long>(btLadder.consecutivePageTimeouts));
+}
+
+// Every session change resets the TX queue and the RX frame parser.
+void openSppSession(uint32_t handle, uint32_t connection) {
+  sppOpen = true;
+  sppHandle = handle;
+  sppConnection = connection;
+  sppCongested = false;
+  sppWriteInFlight = false;
+  sppTxCount = 0;
+  denonRxLength = 0;
+}
+
+void closeSppLocally() {
+  sppOpen = false;
+  sppHandle = 0;
+  sppConnection = 0;
+  sppCongested = false;
+  sppWriteInFlight = false;
+  sppTxCount = 0;
+  denonRxLength = 0;
+  btLadderDisconnected(btLadder, millis());
+}
+
+// Used when the link can no longer be trusted (lost events, failed or stalled
+// writes): ask the stack to close it and treat it as closed now.
+void dropSppLink(const char *reason) {
+  if (!sppOpen) return;
+  Serial.printf("Dropping Denon link: %s\n", reason);
+  esp_spp_disconnect(sppHandle);
+  closeSppLocally();
+}
+
+void acceptSppLink(BtEvent &e, bool incoming) {
+  if (e.status != ESP_SPP_SUCCESS) {
+    if (!incoming && connectInProgress) {
+      finishConnectAttempt(false, attemptPageTimeout ? BtFailure::pageTimeout
+                                                     : BtFailure::other);
+    }
+    return;
+  }
+  bool accept = !sppOpen && !forgetInProgress && isDenonAddress(e.address);
+  if (accept && !denonBonded) refreshDenonBondState();
+  // Incoming links are only accepted from the bonded receiver.
+  accept = accept && (denonBonded || (!incoming && a2dpConnected));
+  if (!accept) {
+    esp_spp_disconnect(e.handle);
+    if (!incoming && connectInProgress && !sppOpen) {
+      finishConnectAttempt(false, BtFailure::other);
+    }
+    return;
+  }
+  openSppSession(e.handle, e.connection);
+  if (connectInProgress) {
+    finishConnectAttempt(true, BtFailure::other);
+  } else {
+    btLadderConnected(btLadder, millis());
+  }
+  if (incoming) Serial.println("Denon opened the control link");
+}
+
+bool currentSession(const BtEvent &e) {
+  return sppOpen && e.handle == sppHandle && e.connection == sppConnection;
+}
+
+void handleSppClose(const BtEvent &e) {
+  if (currentSession(e)) {
+    closeSppLocally();
+    return;
+  }
+  if (connectInProgress && attemptHandle != 0 && e.handle == attemptHandle) {
+    finishConnectAttempt(false, attemptPageTimeout ? BtFailure::pageTimeout
+                                                   : BtFailure::other);
+  }
+}
+
+void setA2dpTransition(bool connecting, bool disconnecting) {
+  a2dpConnecting = connecting;
+  a2dpDisconnecting = disconnecting;
+  if (connecting || disconnecting) a2dpTransitionAt = millis();
+}
+
+void handleA2dpConnection(BtEvent &e) {
+  const auto state = static_cast<esp_a2d_connection_state_t>(e.status);
+  const bool opening = state == ESP_A2D_CONNECTION_STATE_CONNECTING ||
+                       state == ESP_A2D_CONNECTION_STATE_CONNECTED;
+  if (!isDenonAddress(e.address)) {
+    if (opening) esp_a2d_source_disconnect(e.address);
+    return;
+  }
+  if (forgetInProgress && opening) {
     a2dpConnected = false;
-    a2dpDisconnecting = true;
+    setA2dpTransition(false, true);
     clearPairingNumber();
-    esp_a2d_source_disconnect(param->conn_stat.remote_bda);
+    esp_a2d_source_disconnect(e.address);
     return;
   }
 
-  switch (param->conn_stat.state) {
+  switch (state) {
     case ESP_A2D_CONNECTION_STATE_CONNECTING:
-      a2dpConnecting = true;
-      a2dpDisconnecting = false;
+      setA2dpTransition(true, false);
       break;
     case ESP_A2D_CONNECTION_STATE_CONNECTED:
-      a2dpConnecting = false;
+      setA2dpTransition(false, false);
       a2dpConnected = true;
-      a2dpDisconnecting = false;
       pairingTimedOut = false;
       clearPairingNumber();
       nextReconnectAt = 0;
       Serial.println("Denon A2DP connected");
       break;
     case ESP_A2D_CONNECTION_STATE_DISCONNECTING:
-      a2dpConnecting = false;
-      a2dpDisconnecting = true;
+      setA2dpTransition(false, true);
       break;
     case ESP_A2D_CONNECTION_STATE_DISCONNECTED:
       pairingTimedOut = !forgetInProgress && a2dpConnecting;
-      a2dpConnecting = false;
+      setA2dpTransition(false, false);
       a2dpConnected = false;
-      a2dpDisconnecting = false;
       clearPairingNumber();
       nextA2dpReconnectAt = millis() + kReconnectMs;
       Serial.println("Denon A2DP disconnected");
@@ -1852,83 +2547,303 @@ void a2dpEvent(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
   }
 }
 
-bool startA2dp() {
-  if (esp_a2d_register_callback(a2dpEvent) != ESP_OK ||
-      esp_a2d_source_register_data_callback(provideSilentAudio) != ESP_OK ||
-      esp_a2d_source_init() != ESP_OK) {
-    Serial.println("Could not start A2DP source profile");
-    return false;
+void addDiscoveredDevice(const BtEvent &e) {
+  if (!discoveryActive) return;
+  for (size_t i = 0; i < discoveredCount; ++i) {
+    if (memcmp(discovered[i].address, e.address, sizeof(e.address)) == 0) {
+      if (!discovered[i].name[0]) memcpy(discovered[i].name, e.name, sizeof(e.name));
+      return;
+    }
+  }
+  if (discoveredCount == kMaxDiscovered) return;
+  memcpy(discovered[discoveredCount].address, e.address, sizeof(e.address));
+  memcpy(discovered[discoveredCount].name, e.name, sizeof(e.name));
+  ++discoveredCount;
+}
+
+void startSppServer() {
+  sppServerRetryAt = millis() + kSppServerRetryMs;
+  if (esp_spp_start_srv(ESP_SPP_SEC_ENCRYPT | ESP_SPP_SEC_AUTHENTICATE,
+                        ESP_SPP_ROLE_SLAVE, 0, "Denon control") != ESP_OK) {
+    btLastError = "spp_server_failed";
+    Serial.println("Could not start the SPP server");
+  }
+}
+
+void handleBtEvent(BtEvent &e) {
+  switch (e.type) {
+    case BtEventType::aclConnect: {
+      if (!isDenonAddress(e.address)) return;
+      const bool success = aclStatusSucceeded(e.status);
+      btDiagnostics::recordConnect(e.status, static_cast<uint16_t>(e.handle), e.at,
+                                   success);
+      Serial.printf("BT_DIAG ACL_CONNECT t=%u status=%d handle=%u\n", e.at,
+                    static_cast<int>(e.status), static_cast<unsigned>(e.handle));
+      if (e.status == ESP_BT_STATUS_HCI_PAGE_TIMEOUT && connectInProgress) {
+        attemptPageTimeout = true;
+      }
+      // The receiver may open the ACL itself; use it for SPP right away.
+      if (success && denonBonded && !sppOpen && !connectInProgress) nextReconnectAt = 0;
+      return;
+    }
+    case BtEventType::aclDisconnect:
+      if (!isDenonAddress(e.address)) return;
+      btDiagnostics::recordDisconnect(e.status, static_cast<uint16_t>(e.handle), e.at);
+      Serial.printf("BT_DIAG ACL_DISCONNECT t=%u reason=%d handle=%u\n", e.at,
+                    static_cast<int>(e.status), static_cast<unsigned>(e.handle));
+      return;
+    case BtEventType::authComplete:
+      if (!isDenonAddress(e.address)) return;
+      if (e.status == ESP_BT_STATUS_SUCCESS) {
+        refreshDenonBondState();
+      } else {
+        Serial.printf("Denon authentication failed, status %d\n",
+                      static_cast<int>(e.status));
+      }
+      return;
+    case BtEventType::confirmRequest:
+      confirmDenonPairing(e.address, e.value);
+      return;
+    case BtEventType::pinRequest: {
+      esp_bt_pin_code_t pin;
+      memset(pin, '0', sizeof(pin));
+      esp_bt_gap_pin_reply(e.address, true, e.value ? 16 : 4, pin);
+      return;
+    }
+    case BtEventType::discoveryResult:
+      addDiscoveredDevice(e);
+      return;
+    case BtEventType::discoveryState:
+      discoveryRunning = e.status == ESP_BT_GAP_DISCOVERY_STARTED;
+      if (discoveryRunning) discoveryStarted = true;
+      return;
+    case BtEventType::sppInit:
+      sppReady = e.status == ESP_SPP_SUCCESS;
+      if (sppReady) {
+        startSppServer();
+      } else {
+        failBtStart("spp_init_failed");
+      }
+      return;
+    case BtEventType::sppServerStart:
+      sppServerRunning = e.status == ESP_SPP_SUCCESS;
+      if (!sppServerRunning) {
+        btLastError = "spp_server_failed";
+        Serial.printf("SPP server did not start, status %d\n", static_cast<int>(e.status));
+      }
+      return;
+    case BtEventType::sppClientInit:
+      if (!connectInProgress) return;
+      if (e.status != ESP_SPP_SUCCESS) {
+        finishConnectAttempt(false, BtFailure::other);
+      } else {
+        attemptHandle = e.handle;
+      }
+      return;
+    case BtEventType::sppOpen:
+      acceptSppLink(e, false);
+      return;
+    case BtEventType::sppServerOpen:
+      acceptSppLink(e, true);
+      return;
+    case BtEventType::sppClose:
+      handleSppClose(e);
+      return;
+    case BtEventType::sppCongestion:
+      if (!currentSession(e)) return;
+      sppCongested = e.value != 0;
+      pumpDenonTx();
+      return;
+    case BtEventType::sppWrite:
+      if (!currentSession(e)) return;
+      sppWriteInFlight = false;
+      sppTxProgressAt = millis();
+      if (e.status != ESP_SPP_SUCCESS) {
+        dropSppLink("write failed");
+        return;
+      }
+      sppCongested = e.value != 0;
+      pumpDenonTx();
+      return;
+    case BtEventType::a2dpProfile:
+      a2dpReady = e.status == ESP_A2D_INIT_SUCCESS;
+      if (a2dpReady) nextA2dpReconnectAt = 0;
+      return;
+    case BtEventType::a2dpConnection:
+      handleA2dpConnection(e);
+      return;
+  }
+}
+
+void processBtEvents() {
+  // Events are handled only after a successful lifecycle handoff; until then
+  // they wait in the queue (and a later generation bump discards them).
+  if (!btEvents || !bluetoothReady || btLifecycleBusy.load(std::memory_order_acquire) ||
+      btLifecycleResultPending) {
+    return;
+  }
+  BtEvent e;
+  const uint8_t generation = btGeneration.load(std::memory_order_relaxed);
+  while (xQueueReceive(btEvents, &e, 0) == pdTRUE) {
+    if (e.generation == generation) handleBtEvent(e);
+  }
+  const uint32_t drops = btEventDrops.load(std::memory_order_relaxed);
+  if (drops != btEventDropsHandled) {
+    btEventDropsHandled = drops;
+    Serial.printf("Bluetooth event queue overflow (%lu dropped)\n",
+                  static_cast<unsigned long>(drops));
+    dropSppLink("events were lost");
+  }
+}
+
+// Waits in the loop task while still handling Bluetooth events.
+void btPause(unsigned long ms) {
+  esp_task_wdt_reset();
+  delay(ms);
+  processBtEvents();
+}
+
+template <typename Done>
+bool waitBt(Done done, unsigned long timeoutMs) {
+  const unsigned long deadline = millis() + timeoutMs;
+  while (!done()) {
+    if (timeReached(millis(), deadline)) return false;
+    btPause(10);
   }
   return true;
+}
+
+// Ends the receiver link cleanly so the Denon sees a normal disconnect
+// instead of a supervision timeout.
+void shutdownBluetoothLinks() {
+  if (!bluetoothReady) return;
+  forgetInProgress = true;  // reject new links and close A2DP while waiting
+  if (sppOpen) esp_spp_disconnect(sppHandle);
+  if (connectInProgress && attemptHandle) esp_spp_disconnect(attemptHandle);
+  if (a2dpConnecting || a2dpConnected) esp_a2d_source_disconnect(denonMac);
+  const bool closed = waitBt(
+      [] {
+        return !sppOpen && !a2dpConnected && !a2dpConnecting && !a2dpDisconnecting;
+      },
+      kCleanShutdownMs);
+  Serial.println(closed ? "Bluetooth links closed" : "Bluetooth close timed out");
+  // Disabling Bluedroid disconnects any remaining ACL link. The board resets
+  // next, and the loop watchdog bounds this call if the stack is wedged.
+  if (esp_bluedroid_disable() == ESP_OK) rtcBtLifecycleMarker = 0;  // clean stop
+}
+
+void restartDevice(bool clean) {
+  delay(250);  // let the HTTP response leave first
+  if (clean) shutdownBluetoothLinks();
+  rtcBtLifecycleMarker = 0;  // an intentional restart is not a Bluetooth fault
+  delay(50);
+  esp_restart();
 }
 
 void startA2dpConnect() {
   if (!a2dpReady || !hasDenonMac || !denonBondStateKnown || denonBonded ||
       a2dpConnecting || a2dpConnected || a2dpDisconnecting ||
-      connectInProgress || forgetInProgress) {
+      connectInProgress || forgetInProgress || discoveryActive) {
     return;
   }
   clearPairingNumber();
   pairingTimedOut = false;
-  a2dpConnecting = true;
+  setA2dpTransition(true, false);
   if (esp_a2d_source_connect(denonMac) != ESP_OK) {
-    a2dpConnecting = false;
+    setA2dpTransition(false, false);
     nextA2dpReconnectAt = millis() + kReconnectMs;
     Serial.println("Could not start Denon A2DP connection");
   }
 }
 
-void connectDenonTask(void *) {
-  uint8_t address[6];
-  memcpy(address, denonMac, sizeof(address));
-  if ((!denonBonded && !a2dpConnected) || forgetInProgress ||
-      !isDenonAddress(address)) {
-    connectInProgress = false;
-    vTaskDelete(nullptr);
-    return;
-  }
-  Serial.printf("Connecting to Denon at %s\n", macString().c_str());
-
-  // The captured Denon 500-series service uses RFCOMM channel 2. Connecting
-  // directly also avoids the X580BT rejecting SDP before it is paired.
-  const bool connected = serialBt.connect(
-      address, 2, ESP_SPP_SEC_ENCRYPT | ESP_SPP_SEC_AUTHENTICATE,
-      ESP_SPP_ROLE_MASTER);
-  if (connected && !denonBonded) refreshDenonBondState();
-  const bool targetStillConnected =
-      (denonBonded || a2dpConnected) && !forgetInProgress;
-  if (connected && !targetStillConnected) serialBt.disconnect();
-  Serial.println(connected && targetStillConnected ? "Denon connected"
-                                                    : "Denon connection failed");
-  clearPairingNumber();
-  nextReconnectAt = millis() + kReconnectMs;
-  connectInProgress = false;
-  vTaskDelete(nullptr);
-}
-
 void startDenonConnect() {
   if ((!denonBonded && !a2dpConnected) || connectInProgress ||
-      forgetInProgress) {
+      forgetInProgress || !sppReady || sppOpen || discoveryActive) {
     return;
   }
   if (a2dpConnected && !denonBonded) refreshDenonBondState();
   clearPairingNumber();
   pairingTimedOut = false;
-  connectInProgress = true;
-  if (xTaskCreate(connectDenonTask, "denon_connect", 4096, nullptr, 1, nullptr) !=
-      pdPASS) {
-    clearPairingNumber();
-    connectInProgress = false;
-    nextReconnectAt = millis() + kReconnectMs;
-    Serial.println("Could not start Denon connection task");
+  const unsigned long now = millis();
+  // The captured Denon 500-series service uses RFCOMM channel 2. Connecting
+  // directly also avoids the X580BT rejecting SDP before it is paired.
+  if (esp_spp_connect(ESP_SPP_SEC_ENCRYPT | ESP_SPP_SEC_AUTHENTICATE,
+                      ESP_SPP_ROLE_MASTER, kDenonSppChannel, denonMac) != ESP_OK) {
+    btLadderFailure(btLadder, now, BtFailure::other);
+    nextReconnectAt = now + btLadderRetryDelayMs(btLadder);
+    Serial.println("Could not start Denon connection");
+    return;
   }
+  connectInProgress = true;
+  attemptHandle = 0;
+  attemptStartedAt = now;
+  attemptPageTimeout = false;
+  Serial.printf("Connecting to Denon at %s\n", macString().c_str());
+}
+
+// Missing completions are failures too: profile start, server start,
+// writes, connect attempts, and A2DP transitions all have deadlines.
+void checkBtDeadlines(unsigned long now) {
+  if (sppReady && a2dpReady) {
+    btStartFailures = 0;
+  } else if (timeReached(now, btProfilesDeadline)) {
+    failBtStart(!sppReady ? "spp_init_timeout" : "a2dp_init_timeout");
+    return;
+  }
+  if (sppReady && !sppServerRunning && timeReached(now, sppServerRetryAt)) {
+    startSppServer();
+  }
+  // Fresh clock: an event handled earlier in this pass may have just
+  // submitted a write, which must not read as "time since" wrapping around.
+  if (sppOpen && (sppWriteInFlight || sppTxCount) &&
+      static_cast<long>(millis() - sppTxProgressAt) >=
+          static_cast<long>(kBtWriteStallMs)) {
+    dropSppLink("transmit made no progress");
+  }
+  if (connectInProgress && now - attemptStartedAt >= kBtAttemptTimeoutMs) {
+    if (attemptHandle) esp_spp_disconnect(attemptHandle);
+    finishConnectAttempt(false, BtFailure::noResponse);
+  }
+  if ((a2dpConnecting || a2dpDisconnecting) && !forgetInProgress &&
+      now - a2dpTransitionAt >= kA2dpTransitionTimeoutMs) {
+    Serial.println("Denon A2DP transition timed out");
+    btLastError = "a2dp_timeout";
+    esp_a2d_source_disconnect(denonMac);
+    pairingTimedOut = a2dpConnecting;
+    setA2dpTransition(false, false);
+    a2dpConnected = false;
+    clearPairingNumber();
+    nextA2dpReconnectAt = now + kReconnectMs;
+    btLadderFailure(btLadder, now, BtFailure::noResponse);
+  }
+}
+
+void noteDenonDisconnected(unsigned long now) {
+  wasDenonConnected = false;
+  sessionInitialized = false;
+  volumeRaw = -1;
+  muteStateKnown = false;
+  currentPlaybackIdleAuthorized = false;
+  pendingPlaybackIdleAuthorized = false;
+  if (restoreAutomaticMuteCycle || automaticRemuteRequired) {
+    automaticMuteConfirmationPending = false;
+    cancelVolumeRestore();
+  } else {
+    pauseVolumeTargetSession();
+  }
+  nextReconnectAt = now + 1000;
+  Serial.println("Denon disconnected");
 }
 
 void maintainDenon() {
   const unsigned long now = millis();
+  // Also covers links lost to a stack restart while Bluetooth is down.
+  if (!sppOpen && wasDenonConnected) noteDenonDisconnected(now);
+  if (!bluetoothReady) return;
+  checkBtDeadlines(now);
   if (!bluetoothReady || !hasDenonMac || !denonBondStateKnown) return;
 
-  const bool connected = serialBt.connected();
+  const bool connected = sppOpen;
   if (connected) {
     if (!wasDenonConnected) {
       wasDenonConnected = true;
@@ -1939,32 +2854,29 @@ void maintainDenon() {
       nextStatusAt = now + 300;
     }
     if (timeReached(now, nextStatusAt)) {
+      // The TX queue sends in order, one write at a time, so the handshake
+      // and source request complete before the first status request.
       if (!sessionInitialized) {
-        sendDenon(kControlHandshake, sizeof(kControlHandshake));
-        sendDenon(kGetSources, sizeof(kGetSources));
-        sessionInitialized = true;
+        sessionInitialized =
+            sendDenon(kControlHandshake, sizeof(kControlHandshake)) &&
+            sendDenon(kGetSources, sizeof(kGetSources));
       }
-      if (restoreTargetRaw < 0) sendDenon(kGetStatus, sizeof(kGetStatus));
+      if (sessionInitialized && restoreTargetRaw < 0) {
+        sendDenon(kGetStatus, sizeof(kGetStatus));
+      }
       nextStatusAt = now + kStatusIntervalMs;
     }
     return;
   }
 
-  if (wasDenonConnected) {
-    wasDenonConnected = false;
-    sessionInitialized = false;
-    volumeRaw = -1;
-    muteStateKnown = false;
-    currentPlaybackIdleAuthorized = false;
-    pendingPlaybackIdleAuthorized = false;
-    if (restoreAutomaticMuteCycle || automaticRemuteRequired) {
-      automaticMuteConfirmationPending = false;
-      cancelVolumeRestore();
-    } else {
-      pauseVolumeTargetSession();
-    }
-    nextReconnectAt = now + 1000;
-    Serial.println("Denon disconnected");
+  if (wasDenonConnected) noteDenonDisconnected(now);
+
+  if (!connectInProgress && !forgetInProgress && !a2dpConnecting &&
+      !discoveryActive && btLadderShouldRestartStack(btLadder, now)) {
+    btLadderStackRestarted(btLadder, now);
+    requestBtLifecycle(true, btLadder.consecutiveNoResponse ? "no response"
+                                                            : "sustained failures");
+    return;
   }
 
   // A saved bond already provides the authenticated link key. Use only SPP so
@@ -1993,38 +2905,50 @@ void maintainDenon() {
 
 void readDenon() {
   static uint8_t buffer[128];
-  static size_t length = 0;
-  while (serialBt.available()) {
-    if (length == sizeof(buffer)) {
-      memmove(buffer, buffer + 1, --length);
+  uint8_t message[sizeof(BtRxHeader) + kBtRxChunkBytes];
+  size_t received;
+  const uint8_t generation = btGeneration.load(std::memory_order_relaxed);
+  while ((received = xMessageBufferReceive(btRx, message, sizeof(message), 0)) > 0) {
+    BtRxHeader header;
+    memcpy(&header, message, sizeof(header));
+    // Only bytes of the accepted session reach the parser.
+    if (received <= sizeof(header) || !sppOpen || header.generation != generation ||
+        header.handle != sppHandle || header.connection != sppConnection) {
+      continue;
     }
-    buffer[length++] = static_cast<uint8_t>(serialBt.read());
+    size_t &length = denonRxLength;
+    for (size_t k = sizeof(header); k < received; ++k) {
+      if (length == sizeof(buffer)) {
+        memmove(buffer, buffer + 1, --length);
+      }
+      buffer[length++] = message[k];
 
-    bool consumed;
-    do {
-      consumed = false;
-      for (size_t i = 0; i + 7 <= length; ++i) {
-        bool muted = false;
-        if (parseMutePacket(buffer + i, 7, muted)) {
-          observeMute(muted);
-          Serial.printf("Mute: %s\n", muted ? "on" : "off");
-          memmove(buffer, buffer + i + 7, length - (i + 7));
-          length -= i + 7;
+      bool consumed;
+      do {
+        consumed = false;
+        for (size_t i = 0; i + 7 <= length; ++i) {
+          bool muted = false;
+          if (parseMutePacket(buffer + i, 7, muted)) {
+            observeMute(muted);
+            Serial.printf("Mute: %s\n", muted ? "on" : "off");
+            memmove(buffer, buffer + i + 7, length - (i + 7));
+            length -= i + 7;
+            consumed = true;
+            break;
+          }
+          if (i + 9 > length) continue;
+          uint8_t raw = 0;
+          if (!parseVolumePacket(buffer + i, 9, raw)) continue;
+          volumeRaw = raw;
+          observeVolume(raw);
+          Serial.printf("Volume: %.1f\n", raw / 2.0f);
+          memmove(buffer, buffer + i + 9, length - (i + 9));
+          length -= i + 9;
           consumed = true;
           break;
         }
-        if (i + 9 > length) continue;
-        uint8_t raw = 0;
-        if (!parseVolumePacket(buffer + i, 9, raw)) continue;
-        volumeRaw = raw;
-        observeVolume(raw);
-        Serial.printf("Volume: %.1f\n", raw / 2.0f);
-        memmove(buffer, buffer + i + 9, length - (i + 9));
-        length -= i + 9;
-        consumed = true;
-        break;
-      }
-    } while (consumed);
+      } while (consumed);
+    }
   }
 }
 
@@ -2644,8 +3568,7 @@ void maintainTokenResetButton() {
     bootButtonPressedAt = 0;
     if (tokenResetArmed) {
       Serial.println("BOOT released; restarting with Home Assistant unpaired");
-      delay(100);
-      ESP.restart();
+      restartDevice(true);
     }
     return;
   }
@@ -2704,7 +3627,7 @@ void receiveApp() {
   const bool manualTargetActive = restoreTargetRaw >= 0 && !restoreAutomatic;
   if (validIdleEvent &&
       !playbackIdleEventReady(
-          serialBt.connected(), sessionInitialized, volumeRaw, muteStateKnown,
+          sppOpen, sessionInitialized, volumeRaw, muteStateKnown,
           denonMuted, manualMuteLocked, automaticRemuteRequired,
           manualTargetActive)) {
     server.send(503, "text/plain", "Receiver state is not ready for this event");
@@ -2760,7 +3683,7 @@ void sendApps() {
 void sendPage() { server.send_P(200, "text/html; charset=utf-8", kPage); }
 
 void sendState() {
-  const bool connected = serialBt.connected();
+  const bool connected = sppOpen;
   const bool hasVolume = connected && volumeRaw >= 0;
   const bool connecting = a2dpConnecting || connectInProgress;
   const bool pairing = !denonBonded && a2dpConnecting;
@@ -2817,20 +3740,51 @@ void sendState() {
   body += ",\"wifi_last_disconnect_reason\":";
   const int reason = lastWifiDisconnectReason.load(std::memory_order_relaxed);
   body += reason < 0 ? "null" : String(reason);
-  body += ",\"bt_acl_connect_count\":" +
-          String(btDiagnostics::connectCount.load(std::memory_order_relaxed));
-  const int btStatus = btDiagnostics::lastConnectStatus.load(std::memory_order_relaxed);
+  body += ",\"bt_acl_connect_count\":" + String(btDiagnostics::connectCount);
+  const int btStatus = btDiagnostics::lastConnectStatus;
   body += ",\"bt_acl_last_connect_status\":";
   body += btStatus < 0 ? "null" : String(btStatus);
   body += ",\"bt_acl_last_connect_at_ms\":";
-  body += btStatus < 0 ? "null" :
-          String(btDiagnostics::lastConnectAtMs.load(std::memory_order_relaxed));
-  const int btReason = btDiagnostics::lastDisconnectReason.load(std::memory_order_relaxed);
+  body += btStatus < 0 ? "null" : String(btDiagnostics::lastConnectAtMs);
+  const int btReason = btDiagnostics::lastDisconnectReason;
   body += ",\"bt_acl_last_disconnect_reason\":";
   body += btReason < 0 ? "null" : String(btReason);
   body += ",\"bt_acl_last_disconnect_at_ms\":";
-  body += btReason < 0 ? "null" :
-          String(btDiagnostics::lastDisconnectAtMs.load(std::memory_order_relaxed));
+  body += btReason < 0 ? "null" : String(btDiagnostics::lastDisconnectAtMs);
+  const uint32_t now = millis();
+  const char *btStage =
+      btLifecycleBusy.load(std::memory_order_relaxed)
+          ? "stack_starting"
+          : (!bluetoothReady
+                 ? "bluetooth_down"
+                 : btLadderStage(btLadder,
+                                 hasDenonMac && (denonBonded || a2dpConnected),
+                                 connectInProgress));
+  body += ",\"bt_recovery_stage\":\"" + String(btStage) +
+          "\",\"bt_page_timeouts\":" + String(btLadder.consecutivePageTimeouts) +
+          ",\"bt_connect_failures\":" + String(btLadder.consecutiveFailures) +
+          ",\"bt_stack_restarts\":" + String(btLadder.stackRestarts) +
+          ",\"bt_start_failures\":" + String(btStartFailures) +
+          ",\"bt_since_connected_ms\":";
+  body += sppOpen ? "0"
+                  : (btLadder.everConnected ? String(now - btLadder.lastConnectedMs)
+                                            : "null");
+  // btStarted() also links Arduino's strong btInUse(), which keeps
+  // initArduino() from releasing the Bluetooth controller memory at boot.
+  body += ",\"bt_controller_enabled\":" + String(btStarted() ? "true" : "false");
+  body += ",\"bt_last_error\":";
+  body += btLastError ? "\"" + String(btLastError) + "\"" : "null";
+  body += ",\"bt_event_drops\":" +
+          String(btEventDrops.load(std::memory_order_relaxed)) +
+          ",\"bt_rx_drops\":" + String(btRxDrops.load(std::memory_order_relaxed));
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  body += ",\"reset_reason\":" + String(static_cast<int>(esp_reset_reason())) +
+          ",\"ota_slot\":";
+  body += running ? "\"" + String(running->label) + "\"" : "null";
+  body += ",\"ota_state\":\"" + String(otaBootState) +
+          "\",\"ota_trial_boots\":" + String(otaTrialBoots) +
+          ",\"ota_last_result\":";
+  body += otaLastResult.isEmpty() ? "null" : "\"" + jsonEscape(otaLastResult) + "\"";
   body += "}";
   server.send(200, "application/json", body);
 }
@@ -2847,8 +3801,8 @@ void sendVolume(const uint8_t *command, size_t length, int direction) {
     server.send(409, "text/plain", "Volume target is already in progress");
     return;
   }
-  if (!sendDenon(command, length)) {
-    server.send(503, "text/plain", "Receiver is not connected");
+  if (!sendDenonStep(command, length)) {
+    server.send(503, "text/plain", "Receiver is not connected or busy; retry");
     return;
   }
   acceptManualVolumeFeedback(direction);
@@ -2877,7 +3831,7 @@ void sendTargetVolume() {
                 "Volume must be from 0.0 to 98.0 in 0.5 steps");
     return;
   }
-  if (!serialBt.connected() || volumeRaw < 0) {
+  if (!sppOpen || volumeRaw < 0) {
     server.send(503, "text/plain", "Receiver volume is not available");
     return;
   }
@@ -2906,7 +3860,7 @@ void reconnectDenon() {
     server.send(409, "text/plain", "A receiver connection is already active");
     return;
   }
-  if (serialBt.connected()) {
+  if (sppOpen) {
     server.send(204);
     return;
   }
@@ -2941,7 +3895,7 @@ void discoverDenon() {
     return;
   }
   if (forgetInProgress || a2dpConnecting || a2dpConnected || a2dpDisconnecting ||
-      connectInProgress || serialBt.connected()) {
+      connectInProgress || sppOpen) {
     server.send(409, "text/plain", "A receiver connection is already active");
     return;
   }
@@ -2950,25 +3904,41 @@ void discoverDenon() {
     return;
   }
   Serial.println("Bluetooth discovery started");
-  BTScanResults *results = serialBt.discover(8000);
+  discoveredCount = 0;
+  discoveryStarted = false;
+  discoveryRunning = false;
+  discoveryActive = true;
+  // 6 x 1.28 s inquiry, the same length as the previous 8 s scan.
+  if (esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 6, 0) != ESP_OK) {
+    discoveryActive = false;
+    server.send(503, "text/plain", "Bluetooth discovery did not start");
+    return;
+  }
+  waitBt([] { return discoveryStarted && !discoveryRunning; }, 9000);
+  esp_bt_gap_cancel_discovery();
+  discoveryActive = false;
   String body = "{\"devices\":[";
-  if (results) {
-    for (int i = 0; i < results->getCount(); ++i) {
-      BTAdvertisedDevice *device = results->getDevice(i);
-      if (i) body += ',';
-      body += "{\"name\":\"" + jsonEscape(String(device->getName().c_str())) + "\",\"mac\":\"" +
-              device->getAddress().toString() + "\"}";
-    }
+  for (size_t i = 0; i < discoveredCount; ++i) {
+    const uint8_t *a = discovered[i].address;
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", a[0], a[1], a[2],
+             a[3], a[4], a[5]);
+    if (i) body += ',';
+    body += "{\"name\":\"" + jsonEscape(String(discovered[i].name)) +
+            "\",\"mac\":\"" + mac + "\"}";
   }
   body += "]}";
-  serialBt.discoverClear();
   server.send(200, "application/json", body);
 }
 
 void saveDenon() {
   if (!requireProvisioningAuthorization()) return;
+  if (!bluetoothReady) {
+    server.send(503, "text/plain", "Bluetooth Classic is not ready");
+    return;
+  }
   if (forgetInProgress || a2dpConnecting || a2dpConnected || a2dpDisconnecting ||
-      connectInProgress || serialBt.connected()) {
+      connectInProgress || sppOpen) {
     server.send(409, "text/plain", "Forget the current receiver first");
     return;
   }
@@ -3010,9 +3980,12 @@ void forgetDenon() {
     return;
   }
   forgetInProgress = true;
-  if (serialBt.connected() && !serialBt.disconnect()) {
-    forgetFailed(409, "Could not disconnect the receiver; try again");
-    return;
+  if (sppOpen) {
+    esp_spp_disconnect(sppHandle);
+    if (!waitBt([] { return !sppOpen; }, kBondRemovalTimeoutMs)) {
+      forgetFailed(409, "Could not disconnect the receiver; try again");
+      return;
+    }
   }
   if (a2dpConnecting || a2dpConnected || a2dpDisconnecting) {
     if (esp_a2d_source_disconnect(denonMac) != ESP_OK) {
@@ -3022,7 +3995,7 @@ void forgetDenon() {
     const unsigned long deadline = millis() + kBondRemovalTimeoutMs;
     while ((a2dpConnecting || a2dpConnected || a2dpDisconnecting) &&
            !timeReached(millis(), deadline)) {
-      delay(25);
+      btPause(25);
     }
     if (a2dpConnecting || a2dpConnected || a2dpDisconnecting) {
       forgetFailed(504, "Bluetooth disconnect timed out; try again");
@@ -3042,7 +4015,7 @@ void forgetDenon() {
     }
     const unsigned long deadline = millis() + kBondRemovalTimeoutMs;
     do {
-      delay(25);
+      btPause(25);
       state = bondState(denonMac);
       if (state == BondState::Error) {
         forgetFailed(500, "Could not verify Bluetooth bond removal; receiver was not forgotten");
@@ -3063,8 +4036,7 @@ void forgetDenon() {
   hasDenonMac = false;
   volumeRaw = -1;
   server.send(202, "text/plain", "Restarting");
-  delay(250);
-  ESP.restart();
+  restartDevice(true);
 }
 
 void saveWifi() {
@@ -3111,8 +4083,7 @@ void saveWifi() {
   }
   staticNetworkEnabled = false;
   server.send(202, "text/plain", "Restarting");
-  delay(250);
-  ESP.restart();
+  restartDevice(true);
 }
 
 void saveNetwork() {
@@ -3136,8 +4107,7 @@ void saveNetwork() {
     return;
   }
   server.send(202, "text/plain", "Restarting with fixed IP");
-  delay(250);
-  ESP.restart();
+  restartDevice(true);
 }
 
 void clearNetwork() {
@@ -3148,23 +4118,347 @@ void clearNetwork() {
     return;
   }
   server.send(202, "text/plain", "Restarting with DHCP");
-  delay(250);
-  ESP.restart();
+  restartDevice(true);
 }
 
-void setupWeb() {
+// ---- OTA boot guard ----
+// An uploaded image stays on trial until POST /api/firmware/confirm reaches it
+// over the station network with the bearer token. The bootloader rolls back an
+// unconfirmed image on its first failed boot; the "ota" NVS counter is the
+// fallback if it does not, and the trial timeout restarts a silent image.
+
+esp_ota_img_states_t runningImageState = ESP_OTA_IMG_UNDEFINED;
+
+void readOtaImageState() {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  if (!running || esp_ota_get_state_partition(running, &runningImageState) != ESP_OK) {
+    runningImageState = ESP_OTA_IMG_UNDEFINED;
+  }
+  otaPendingVerify = runningImageState == ESP_OTA_IMG_PENDING_VERIFY;
+  if (otaPendingVerify) otaBootState = "trial";
+}
+
+bool clearOtaTrial(const char *result) {
+  const bool cleared = otaPreferences.remove("ota_trial") &&
+                       otaPreferences.remove("ota_boots") &&
+                       otaPreferences.putString("ota_last", result) > 0;
+  if (cleared) {
+    otaLastResult = result;
+    otaTrialActive = false;
+  }
+  return cleared;
+}
+
+// Runs before the self-checks so a broken image still counts its boots.
+void startOtaGuard() {
+  readOtaImageState();
+  if (!otaPreferences.begin("ota", false)) {
+    Serial.println("Could not open OTA guard storage");
+    return;
+  }
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  otaLastResult = otaPreferences.getString("ota_last", "");
+  const String trial = otaPreferences.getString("ota_trial", "");
+  const uint8_t previousBoots = otaPreferences.getUChar("ota_boots", 0);
+  switch (otaBootAction(!trial.isEmpty(), running && trial == running->label,
+                        previousBoots)) {
+    case OtaBootAction::stable:
+      return;
+    case OtaBootAction::rolledBack:
+      clearOtaTrial("rolled_back");
+      otaBootState = "rolled_back";
+      Serial.printf("Firmware in %s was not confirmed; bootloader rolled back\n",
+                    trial.c_str());
+      return;
+    case OtaBootAction::trial:
+      // Confirmed in otadata but the NVS clear did not land: reconcile.
+      if (runningImageState == ESP_OTA_IMG_VALID) {
+        otaTrialActive = true;
+        clearOtaTrial("ok");
+        otaBootState = "confirmed";
+        return;
+      }
+      otaTrialBoots = previousBoots + 1;
+      otaPreferences.putUChar("ota_boots", otaTrialBoots);
+      otaTrialActive = true;
+      otaBootState = "trial";
+      Serial.printf("Firmware trial boot %u of %u in %s\n", otaTrialBoots,
+                    kOtaMaxTrialBoots, running->label);
+      return;
+    case OtaBootAction::fallback: {
+      const esp_partition_t *previous = esp_ota_get_next_update_partition(nullptr);
+      // esp_ota_set_boot_partition verifies the previous image first.
+      if (previous && esp_ota_set_boot_partition(previous) == ESP_OK) {
+        clearOtaTrial("fallback");
+        Serial.printf("Firmware in %s was never confirmed; booting %s\n",
+                      running->label, previous->label);
+        delay(100);
+        esp_restart();
+      }
+      clearOtaTrial("fallback_failed");
+      otaBootState = "fallback_failed";
+      Serial.println("Previous firmware slot is not bootable; keeping this image");
+      return;
+    }
+  }
+}
+
+void maintainOtaGuard() {
+  // An unconfirmed image restarts, so the bootloader rollback or the trial
+  // boot counter can return to the previous image.
+  if ((otaTrialActive || otaPendingVerify) && otaTrialTimedOut(millis())) {
+    Serial.println("Firmware trial was not confirmed; restarting");
+    restartDevice(true);
+  }
+}
+
+bool currentRequestUsesStation() {
+  const IPAddress localAddress = server.client().localIP();
+  return isStationIngress(WiFi.status() == WL_CONNECTED,
+                          localAddress == WiFi.localIP(),
+                          localAddress == WiFi.softAPIP());
+}
+
+void confirmFirmware() {
+  if (!requireBackupAuthorization()) return;
+  // Destination address alone is not a reliable ingress check, so the
+  // setup access point must be down as well.
+  if (setupApRunning || !currentRequestUsesStation()) {
+    server.send(403, "text/plain",
+                "Confirm firmware over the home network with the setup AP off");
+    return;
+  }
+  if (!selfCheckPassed) {
+    server.send(409, "text/plain", "Firmware self-check failed; not confirming");
+    return;
+  }
+  if (!otaTrialActive && !otaPendingVerify) {
+    server.send(409, "text/plain", "No unconfirmed firmware");
+    return;
+  }
+  if (otaPendingVerify && esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) {
+    server.send(500, "text/plain", "Could not mark firmware valid");
+    return;
+  }
+  otaPendingVerify = false;
+  if (otaTrialActive && !clearOtaTrial("ok")) {
+    server.send(500, "text/plain", "Could not clear the firmware trial record");
+    return;
+  }
+  otaBootState = "confirmed";
+  Serial.println("Firmware confirmed");
+  server.send(200, "application/json", "{\"confirmed\":true}");
+}
+
+// ---- Firmware upload: POST /api/firmware, raw application/octet-stream ----
+
+// Answers and closes the request socket, which also ends WebServer's body
+// parsing, so a rejected upload is never read further.
+void rejectFirmware(int status, const String &message) {
+  if (Update.isRunning()) Update.abort();
+  if (status == 401) server.sendHeader("WWW-Authenticate", "Bearer");
+  server.send(status, "text/plain", message);
+  server.requestClient().stop();
+  Serial.printf("Firmware upload rejected: %s\n", message.c_str());
+}
+
+bool persistOtaTrial(const char *label) {
+  return otaPreferences.putString("ota_trial", label) > 0 &&
+         otaPreferences.putUChar("ota_boots", 0) > 0 &&
+         otaPreferences.getString("ota_trial", "") == label &&
+         otaPreferences.getUChar("ota_boots", 0xFF) == 0;
+}
+
+// Reads the whole body itself: reads are capped at the remaining declared
+// length and the body has a total deadline.
+void receiveFirmware() {
+  // Token only: the setup access point never authorizes a firmware update.
+  if (!hasAppAuthorization()) {
+    rejectFirmware(401, "Missing or invalid bearer token");
+    return;
+  }
+  // Writing the other slot now would overwrite the only rollback target.
+  if (otaTrialActive || otaPendingVerify) {
+    rejectFirmware(409, "Running firmware is not confirmed yet");
+    return;
+  }
+  const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
+  if (!target) {
+    rejectFirmware(503, "No update slot is available");
+    return;
+  }
+  const long length = server.clientContentLength();
+  if (!firmwareSizeAcceptable(length, target->size)) {
+    rejectFirmware(413, "Image size must be " + String(kFirmwareHeaderBytes) +
+                            " to " + String(target->size) + " bytes");
+    return;
+  }
+  if (!Update.begin(static_cast<size_t>(length))) {
+    rejectFirmware(500, String("Could not start update: ") + Update.errorString());
+    return;
+  }
+  Serial.printf("Firmware upload started: %ld bytes to %s\n", length, target->label);
+  WiFiClient &client = server.requestClient();
+  static uint8_t chunk[1024];
+  uint8_t header[kFirmwareHeaderBytes];
+  size_t received = 0;
+  const unsigned long deadline = millis() + kFirmwareBodyTimeoutMs;
+  while (received < static_cast<size_t>(length)) {
+    esp_task_wdt_reset();
+    if (timeReached(millis(), deadline)) {
+      rejectFirmware(408, "Upload took too long");
+      return;
+    }
+    const size_t want = min(sizeof(chunk), static_cast<size_t>(length) - received);
+    const int got = client.available() ? client.read(chunk, want) : 0;
+    if (got <= 0) {
+      if (!client.connected()) {
+        rejectFirmware(400, "Upload aborted");
+        return;
+      }
+      delay(1);
+      continue;
+    }
+    if (received < kFirmwareHeaderBytes) {
+      const size_t copy = min(static_cast<size_t>(got), kFirmwareHeaderBytes - received);
+      memcpy(header + received, chunk, copy);
+      if (received + copy == kFirmwareHeaderBytes &&
+          !firmwareHeaderValid(header, sizeof(header))) {
+        rejectFirmware(415, "Not an ESP32 application image");
+        return;
+      }
+    }
+    if (Update.write(chunk, got) != static_cast<size_t>(got)) {
+      rejectFirmware(500, String("Flash write failed: ") + Update.errorString());
+      return;
+    }
+    received += got;
+  }
+  // Arm the boot guard before the boot slot can change; refuse if it cannot.
+  if (!persistOtaTrial(target->label)) {
+    otaPreferences.remove("ota_trial");
+    rejectFirmware(500, "Could not record the firmware trial");
+    return;
+  }
+  // Update.end verifies the whole image (checksum and SHA-256) before it
+  // switches the boot slot; on failure the running slot stays selected.
+  if (!Update.end()) {
+    otaPreferences.remove("ota_trial");
+    otaPreferences.remove("ota_boots");
+    rejectFirmware(422, String("Image verification failed: ") + Update.errorString());
+    return;
+  }
+  Serial.printf("Firmware written to %s; restarting\n", target->label);
+  server.send(202, "application/json",
+              "{\"accepted\":true,\"slot\":\"" + String(target->label) +
+                  "\",\"restarting\":true}");
+  server.requestClient().stop();
+  firmwareRestartPending = true;
+}
+
+// WebServer calls raw() only for non-multipart bodies and upload() only for
+// multipart ones, so the body mode comes from its parser, not from headers.
+class FirmwareHandler : public RequestHandler {
+ public:
+  bool canHandle(HTTPMethod method, String uri) override {
+    return method == HTTP_POST && uri == "/api/firmware";
+  }
+  bool canUpload(String uri) override { return uri == "/api/firmware"; }
+  bool canRaw(String uri) override { return uri == "/api/firmware"; }
+  bool handle(WebServer &, HTTPMethod method, String uri) override {
+    if (!canHandle(method, uri)) return false;
+    // Reached only for a multipart body without a file part.
+    server.send(415, "text/plain", "Send the image as application/octet-stream");
+    return true;
+  }
+  void upload(WebServer &, String, HTTPUpload &upload) override {
+    if (upload.status == UPLOAD_FILE_START) {
+      rejectFirmware(415, "Send the image as application/octet-stream");
+    }
+  }
+  void raw(WebServer &, String, HTTPRaw &raw) override {
+    if (raw.status == RAW_START) receiveFirmware();
+  }
+};
+
+// Streams the stored coredump in 1 KiB pieces; nothing is buffered beyond that.
+void sendCoredump() {
+  if (!requireBackupAuthorization()) return;
+  size_t address = 0;
+  size_t size = 0;
+  if (esp_core_dump_image_get(&address, &size) != ESP_OK || size == 0) {
+    server.send(404, "text/plain", "No coredump is stored");
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  // Raw ESP-IDF flash coredump (ELF payload in its flash wrapper).
+  server.sendHeader("Content-Disposition", "attachment; filename=coredump.bin");
+  server.setContentLength(size);
+  server.send(200, "application/octet-stream", "");
+  static char chunk[1024];
+  for (size_t offset = 0; offset < size;) {
+    esp_task_wdt_reset();
+    const size_t length = min(sizeof(chunk), size - offset);
+    if (esp_flash_read(nullptr, chunk, address + offset, length) != ESP_OK ||
+        !server.client().connected()) {
+      server.requestClient().stop();
+      return;
+    }
+    server.sendContent(chunk, length);
+    offset += length;
+  }
+}
+
+void eraseCoredump() {
+  if (!requireBackupAuthorization()) return;
+  if (esp_core_dump_image_erase() != ESP_OK) {
+    server.send(500, "text/plain", "Could not erase the coredump");
+    return;
+  }
+  server.send(204);
+}
+
+void restartApi() {
+  if (!hasAppAuthorization()) {
+    server.sendHeader("WWW-Authenticate", "Bearer");
+    server.send(401, "text/plain", "Missing or invalid bearer token");
+    return;
+  }
+  const String mode = server.arg("mode");
+  if (mode != "clean" && mode != "abrupt") {
+    server.send(400, "text/plain", "mode must be clean or abrupt");
+    return;
+  }
+  Serial.printf("Restart requested (%s)\n", mode.c_str());
+  server.send(202, "application/json",
+              "{\"restarting\":true,\"mode\":\"" + mode + "\"}");
+  // Abrupt skips the Bluetooth shutdown to simulate a crash.
+  restartDevice(mode == "clean");
+}
+
+// Recovery routes (info, pairing, state, logs, firmware upload, restart,
+// coredump) are always served; normal controls only after the self-checks.
+void setupWeb(bool full) {
   const char *headers[] = {"Authorization", "If-Match", "Origin", "Host"};
   server.collectHeaders(headers, 4);
-  server.on("/", HTTP_GET, sendPage);
   server.on("/api/info", HTTP_GET, sendInfo);
   server.on("/api/pair", HTTP_POST, pairApi);
+  server.on("/api/state", HTTP_GET, sendState);
+  server.on("/api/logs", HTTP_GET, sendLogs);
+  server.addHandler(new FirmwareHandler());
+  server.on("/api/restart", HTTP_POST, restartApi);
+  server.on("/api/coredump", HTTP_GET, sendCoredump);
+  server.on("/api/coredump", HTTP_DELETE, eraseCoredump);
+  if (!full) {
+    server.begin();
+    return;
+  }
+  server.on("/", HTTP_GET, sendPage);
   server.on("/api/unpair", HTTP_POST, unpairApi);
   server.on("/api/app", HTTP_POST, receiveApp);
   server.on("/api/apps", HTTP_GET, sendApps);
-  server.on("/api/logs", HTTP_GET, sendLogs);
   server.on("/api/backup", HTTP_GET, sendBackup);
   server.on("/api/backup", HTTP_PUT, restoreBackup);
-  server.on("/api/state", HTTP_GET, sendState);
   server.on("/api/volume", HTTP_POST, sendTargetVolume);
   server.on("/api/volume/up", HTTP_POST,
             [] { sendVolume(kVolumeUp, sizeof(kVolumeUp), 1); });
@@ -3177,6 +4471,7 @@ void setupWeb() {
   server.on("/api/wifi", HTTP_POST, saveWifi);
   server.on("/api/network", HTTP_POST, saveNetwork);
   server.on("/api/network", HTTP_DELETE, clearNetwork);
+  server.on("/api/firmware/confirm", HTTP_POST, confirmFirmware);
   server.onNotFound([] { server.sendHeader("Location", "/"); server.send(302); });
   server.begin();
 }
@@ -3187,19 +4482,34 @@ void setup() {
   Serial.begin(115200);
   networkLogs::begin();
   Serial.printf("Boot reset reason: %d\n", static_cast<int>(esp_reset_reason()));
+  // Loop watchdog: longer than the longest legitimate block (8 s discovery).
+  esp_task_wdt_init(kLoopWatchdogSeconds, true);
+  esp_task_wdt_add(nullptr);
+  startOtaGuard();
+  // A set marker means the last boot died inside the Bluetooth lifecycle.
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  const bool btLifecycleInterrupted = resetReason != ESP_RST_POWERON &&
+                                      rtcBtLifecycleMarker == kBtLifecycleMarker;
+  // Kept armed through a deferred start, so a reset during the deferral
+  // defers again; requestBtLifecycle() re-arms it when Bluetooth starts.
+  if (resetReason == ESP_RST_POWERON) rtcBtLifecycleMarker = 0;
   pinMode(kBootButtonPin, INPUT_PULLUP);
-  if (!protocolSelfCheck() || !appStateSelfCheck() || !jsonSelfCheck() ||
-      !networkSelfCheck()) {
-    Serial.println("Firmware self-check failed");
-    return;
-  }
+  selfCheckPassed = protocolSelfCheck() && appStateSelfCheck() && jsonSelfCheck() &&
+                    networkSelfCheck();
   preferences.begin("denon", false);
-  automaticRemuteRequired = preferences.getBool("remute", false);
-  automaticRemuteJournalPersisted = automaticRemuteRequired;
-  restoreLearningSuppressed = automaticRemuteRequired;
   loadDeviceIdentity();
-  loadAppVolumes();
-  loadDenonMac();
+  if (selfCheckPassed) {
+    automaticRemuteRequired = preferences.getBool("remute", false);
+    automaticRemuteJournalPersisted = automaticRemuteRequired;
+    restoreLearningSuppressed = automaticRemuteRequired;
+    loadAppVolumes();
+    loadDenonMac();
+  } else {
+    // Keep Wi-Fi and the authenticated upload up so a fixed image can be
+    // installed; Bluetooth, controls and firmware confirmation stay off.
+    btLastError = "self_check_failed";
+    Serial.println("Firmware self-check failed; recovery mode");
+  }
   WiFi.onEvent(
       [](arduino_event_id_t, arduino_event_info_t info) {
         const int reason = info.wifi_sta_disconnected.reason;
@@ -3208,24 +4518,36 @@ void setup() {
       },
       ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   startWifi();
-  serialBt.enableSSP();
-  serialBt.onConfirmRequest(confirmDenonPairing);
-  serialBt.setPin("0000");
-  bluetoothReady = serialBt.begin("Denon ESP32", true);
-  if (!bluetoothReady) {
-    Serial.println("Bluetooth Classic failed to start");
+  // HTTP (and so OTA) comes up before Bluetooth and never waits for it.
+  setupWeb(selfCheckPassed);
+  if (!selfCheckPassed) return;
+  btEvents = xQueueCreate(kBtEventQueueLength, sizeof(BtEvent));
+  btRx = xMessageBufferCreate(kBtRxBufferBytes);
+  if (!btEvents || !btRx) {
+    btLastError = "bt_queue_alloc_failed";
+  } else if (btLifecycleInterrupted) {
+    btLastError = "recovery_mode";
+    nextStackRetryAt = millis() + btBootStartDelayMs(true);
+    Serial.println("Last boot stopped in Bluetooth start; delaying Bluetooth");
   } else {
-    if (!refreshDenonBondState() || !startA2dp()) bluetoothReady = false;
+    requestBtLifecycle(false, "boot");
   }
-  setupWeb();
 }
 
 void loop() {
+  esp_task_wdt_reset();
   maintainTokenResetButton();
+  // Receiver feedback (a mute report) is parsed before anything can send.
+  if (bluetoothReady) readDenon();
   server.handleClient();
   if (setupApRunning) dnsServer.processNextRequest();
+  if (firmwareRestartPending) restartDevice(true);
   maintainWifi();
+  maintainOtaGuard();
+  if (!selfCheckPassed) return;
+  maintainBtLifecycle();  // consume the lifecycle result before any event
   if (bluetoothReady) readDenon();
+  processBtEvents();
   maintainManualMuteLock();
   maintainAppSwitch();
   maintainVolumeRestore();

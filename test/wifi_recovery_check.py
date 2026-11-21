@@ -6,7 +6,8 @@ import tempfile
 
 
 source = (Path(__file__).parents[1] / "src" / "main.cpp").read_text()
-maintain_wifi = source[source.index("void maintainWifi()") : source.index("bool sendDenon(")]
+start = source.index("void maintainWifi()")
+maintain_wifi = source[start : source.index("\n}\n", start) + 2]
 
 harness = r'''
 #include <cassert>

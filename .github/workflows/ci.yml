@@ -23,7 +23,8 @@ jobs:
       - run: pio run
       - run: python test/protocol_check.py
       - run: python test/wifi_recovery_check.py
-      - run: c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Itest/bt_stubs -Iinclude test/bt_diagnostics_check.cpp -o /tmp/bt-diagnostics-check && /tmp/bt-diagnostics-check
+      - run: c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Iinclude test/bt_diagnostics_check.cpp -o /tmp/bt-diagnostics-check && /tmp/bt-diagnostics-check
+      - run: c++ -std=c++17 -Wall -Wextra -Werror -pedantic test/recovery_policy_check.cpp -o /tmp/recovery-policy-check && /tmp/recovery-policy-check
       - run: c++ -std=c++17 -Wall -Wextra -Werror -pedantic -pthread -Itest/network_log_stubs -Iinclude test/network_logs_check.cpp -o /tmp/network-logs-check && /tmp/network-logs-check
       - run: python test/network_logs_api_check.py
       - run: c++ -std=c++17 -Wall -Wextra -Werror -pedantic test/volume_target_check.cpp -o /tmp/volume-target-check && /tmp/volume-target-check
