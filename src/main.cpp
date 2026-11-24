@@ -328,6 +328,9 @@ std::atomic<const char *> btLifecycleError{nullptr};
 std::atomic<bool> sppUninitDone{false};
 std::atomic<bool> btTeardownFailed{false};
 std::atomic<bool> a2dpDeinitDone{false};
+std::atomic<bool> btModemSleepDisabled{false};
+std::atomic<uint8_t> btPowerMode{0};  // esp_bt_pm_mode_t of the last mode change
+std::atomic<uint32_t> btModeChanges{0};
 bool btLifecycleResultPending = false;
 unsigned long btLifecycleStartedAt = 0;
 unsigned long btProfilesDeadline = 0;
@@ -2040,6 +2043,10 @@ void gapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
         }
       }
       break;
+    case ESP_BT_GAP_MODE_CHG_EVT:
+      btPowerMode.store(param->mode_chg.mode, std::memory_order_relaxed);
+      btModeChanges.fetch_add(1, std::memory_order_relaxed);
+      return;
     case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
       e.type = BtEventType::discoveryState;
       e.status = param->disc_st_chg.state;
@@ -2246,6 +2253,11 @@ const char *btStartup() {
   if (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED) {
     return "controller_not_enabled";
   }
+  // Idle-link panics (pc=0x20000000 in IDLE0 beside btController, 23-30 h
+  // into a link) point at the controller's modem-sleep path; we run on
+  // mains, so keep the controller awake.
+  btModemSleepDisabled.store(esp_bt_sleep_disable() == ESP_OK,
+                             std::memory_order_relaxed);
   if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED &&
       esp_bluedroid_init() != ESP_OK) {
     return "bluedroid_init_failed";
@@ -2288,6 +2300,7 @@ const char *btStartup() {
 }
 
 void btLifecycleTask(void *restart) {
+  btModemSleepDisabled.store(false, std::memory_order_relaxed);
   const char *error = restart ? btTeardown() : nullptr;
   if (error) btTeardownFailed.store(true, std::memory_order_relaxed);
   if (!error) {
@@ -3776,7 +3789,14 @@ void sendState() {
   body += btLastError ? "\"" + String(btLastError) + "\"" : "null";
   body += ",\"bt_event_drops\":" +
           String(btEventDrops.load(std::memory_order_relaxed)) +
-          ",\"bt_rx_drops\":" + String(btRxDrops.load(std::memory_order_relaxed));
+          ",\"bt_rx_drops\":" + String(btRxDrops.load(std::memory_order_relaxed)) +
+          ",\"bt_modem_sleep_disabled\":" +
+          String(btModemSleepDisabled.load(std::memory_order_relaxed) ? "true" : "false") +
+          ",\"bt_mode_changes\":" + String(btModeChanges.load(std::memory_order_relaxed)) +
+          ",\"bt_power_mode\":" +
+          (btModeChanges.load(std::memory_order_relaxed)
+               ? String(btPowerMode.load(std::memory_order_relaxed))
+               : String("null"));
   const esp_partition_t *running = esp_ota_get_running_partition();
   body += ",\"reset_reason\":" + String(static_cast<int>(esp_reset_reason())) +
           ",\"ota_slot\":";
