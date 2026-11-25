@@ -1,9 +1,11 @@
-# Home Assistant package: phone alert when the ESP32 loses control of the Denon.
+# Home Assistant package: power-cycles the Denon and alerts the phone when the
+# ESP32 loses control of it.
 # Install: copy to <HA config>/packages/ and add to configuration.yaml:
 #   homeassistant:
 #     packages: !include_dir_named packages
 # Set denon_state_url in secrets.yaml to the ESP32's /api/state URL.
 # Replace notify.notify with your phone's notify service (notify.mobile_app_<device>).
+# Replace switch.denon_power with the smart socket that powers the Denon.
 
 rest:
   - resource: !secret denon_state_url
@@ -16,6 +18,30 @@ rest:
         value_template: "{{ value_json.connected | default(false) }}"
 
 automation:
+  # The receiver refuses new Bluetooth links until its power is cycled
+  # (README: Reset and re-pair), so cut its smart socket for 1 second.
+  - id: denon_link_power_cycle
+    alias: Denon link power cycle
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.denon_bluetooth_link
+        to: "off"
+        for: "00:00:30"
+    conditions:
+      # Leave a socket that was switched off on purpose alone.
+      - condition: state
+        entity_id: switch.denon_power
+        state: "on"
+    actions:
+      - action: switch.turn_off
+        target:
+          entity_id: switch.denon_power
+      - delay: "00:00:01"
+      - action: switch.turn_on
+        target:
+          entity_id: switch.denon_power
+
   - id: denon_link_alert_lost
     alias: Denon link lost alert
     mode: single
@@ -43,8 +69,8 @@ automation:
           message: >-
             {% if is_state('binary_sensor.denon_bluetooth_link', 'unavailable') %}The ESP32 has not
             answered on the network for 1 minute.{% else %}The ESP32 has had no
-            Bluetooth link to the Denon for 1 minute. If it does not reconnect,
-            restart the Denon.{% endif %}
+            Bluetooth link to the Denon for 1 minute, even after its power
+            cycle. Check the Denon and its smart socket.{% endif %}
 
   - id: denon_link_alert_restored
     alias: Denon link restored alert
