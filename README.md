@@ -615,8 +615,9 @@ tests; return to TV Audio afterward. See `ACCEPTANCE.md`.
 
 `homeassistant/packages/denon_link_alert.yaml` polls `GET /api/state` every
 10 seconds. After the link has been down for 30 seconds it switches the
-Denon's smart socket off and back on after 1 second, unless the socket is
-already off; an unreachable ESP32 does not cycle the Denon. It sends a phone
+Denon's smart socket off and back on after 1 second, at most once per
+10 minutes, unless the socket is already off; an unreachable ESP32 does not
+cycle the Denon. It sends a phone
 notification after the link has been down, or the ESP32 unreachable, for
 1 minute, and again when the link returns.
 
