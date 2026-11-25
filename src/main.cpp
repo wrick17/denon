@@ -328,6 +328,8 @@ std::atomic<const char *> btLifecycleError{nullptr};
 std::atomic<bool> sppUninitDone{false};
 std::atomic<bool> btTeardownFailed{false};
 std::atomic<bool> a2dpDeinitDone{false};
+// A2DP is registered only while pairing needs it; see btStartup.
+std::atomic<bool> a2dpRegistered{false};
 std::atomic<bool> btModemSleepDisabled{false};
 std::atomic<uint8_t> btPowerMode{0};  // esp_bt_pm_mode_t of the last mode change
 std::atomic<uint32_t> btModeChanges{0};
@@ -2210,10 +2212,13 @@ bool waitFlag(std::atomic<bool> &flag, unsigned long timeoutMs) {
 const char *btTeardown() {
   if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) {
     a2dpDeinitDone.store(false, std::memory_order_relaxed);
-    if (esp_a2d_source_deinit() == ESP_OK &&
+    // No callback is registered to confirm deinit of a profile never started.
+    if (a2dpRegistered.load(std::memory_order_relaxed) &&
+        esp_a2d_source_deinit() == ESP_OK &&
         !waitFlag(a2dpDeinitDone, kBtProfileWaitMs)) {
       return "a2dp_deinit_timeout";
     }
+    a2dpRegistered.store(false, std::memory_order_relaxed);
     sppUninitDone.store(false, std::memory_order_relaxed);
     if (esp_spp_deinit() == ESP_OK && !waitFlag(sppUninitDone, kBtProfileWaitMs)) {
       return "spp_deinit_timeout";
@@ -2291,11 +2296,17 @@ const char *btStartup() {
   if (esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE) != ESP_OK) {
     return "scan_mode_failed";
   }
+  // A2DP only bootstraps pairing. A bonded Denon opens it on its own after
+  // mains power-up, and the A2DP service discovery that follows
+  // (bta_av_do_disc_a2d) exhausts the heap: Wi-Fi stalls, Bluedroid asserts.
+  // With no AVDTP PSM registered, L2CAP rejects that channel instead.
+  if (hasDenonMac && bondState(denonMac) == BondState::Present) return nullptr;
   if (esp_a2d_register_callback(a2dpCallback) != ESP_OK ||
       esp_a2d_source_register_data_callback(provideSilentAudio) != ESP_OK ||
       esp_a2d_source_init() != ESP_OK) {
     return "a2dp_start_failed";
   }
+  a2dpRegistered.store(true, std::memory_order_relaxed);
   return nullptr;
 }
 
@@ -2400,6 +2411,13 @@ void maintainBtLifecycle() {
   if (!bluetoothReady && nextStackRetryAt != 0 && timeReached(now, nextStackRetryAt)) {
     nextStackRetryAt = 0;
     requestBtLifecycle(true, btLastError ? btLastError : "start");
+    return;
+  }
+  // A new receiver or a lost bond needs A2DP to pair, which a bonded start
+  // left unregistered; restart the stack once so btStartup registers it.
+  if (bluetoothReady && hasDenonMac && denonBondStateKnown && !denonBonded &&
+      !forgetInProgress && !a2dpRegistered.load(std::memory_order_relaxed)) {
+    requestBtLifecycle(true, "pairing needs A2DP");
   }
 }
 
@@ -2612,6 +2630,7 @@ void handleBtEvent(BtEvent &e) {
       } else {
         Serial.printf("Denon authentication failed, status %d\n",
                       static_cast<int>(e.status));
+        refreshDenonBondState();  // Bluedroid drops the link key on auth failure
       }
       return;
     case BtEventType::confirmRequest:
@@ -2797,7 +2816,7 @@ void startDenonConnect() {
 // Missing completions are failures too: profile start, server start,
 // writes, connect attempts, and A2DP transitions all have deadlines.
 void checkBtDeadlines(unsigned long now) {
-  if (sppReady && a2dpReady) {
+  if (sppReady && (a2dpReady || !a2dpRegistered.load(std::memory_order_relaxed))) {
     btStartFailures = 0;
   } else if (timeReached(now, btProfilesDeadline)) {
     failBtStart(!sppReady ? "spp_init_timeout" : "a2dp_init_timeout");
