@@ -161,6 +161,36 @@ assert bt_start.index("esp_bt_controller_init(&config) != ESP_OK") < bt_start.in
     "esp_bluedroid_init() != ESP_OK"
 )
 assert "ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE" in bt_start
+# Classic-only controller; BLE memory is released once per boot, before any init.
+assert bt_start.index("config.mode = ESP_BT_MODE_CLASSIC_BT;") < bt_start.index(
+    "esp_bt_controller_init(&config)"
+)
+assert source.count("esp_bt_controller_mem_release(") == 1
+assert setup.index("esp_bt_controller_mem_release(") < setup.index('requestBtLifecycle(false, "boot")')
+# Page scan stays on; Wi-Fi power save is restored right before controller enable.
+assert "ESP_BT_NON_CONNECTABLE" not in source
+assert bt_start.index("esp_wifi_set_ps(WIFI_PS_MIN_MODEM)") < bt_start.index(
+    "esp_bt_controller_enable("
+)
+assert '"wifi_ps_restore_failed"' in bt_start
+assert source.count("esp_wifi_set_ps(") == 1  # nothing else turns power save off with Bluetooth
+assert "/api/diag/radio" not in source and "esp_coex_preference_set" not in source
+# Maintenance: marker consumed at boot, no Bluetooth start, window ends in a restart.
+assert setup.index("rtcMaintenanceMarker = 0;") < setup.index("setupWeb(selfCheckPassed);")
+assert setup.index("if (maintenanceMode) {") < setup.index("btEvents = xQueueCreate(")
+assert setup.index("WiFi.setSleep(WIFI_PS_NONE)") < setup.index("startWifi();")
+maintenance = source[source.index("void enterMaintenance()") : source.index("void setupWeb(bool full)")]
+assert "requireBearerToken()" in maintenance
+assert "setupApRunning || !currentRequestUsesStation()" in maintenance
+assert "otaTrialActive || otaPendingVerify" in maintenance
+assert maintenance.index("rtcMaintenanceMarker = kMaintenanceMarker;") < maintenance.index("restartDevice(true);")
+loop_body = source[source.index("void loop()") :]
+assert "maintenanceMode && timeReached(millis(), kMaintenanceWindowMs)" in loop_body
+upload = source[source.index("void receiveFirmware()") : source.index("class FirmwareHandler")]
+assert upload.index("maintenanceMode && timeReached(millis(), kMaintenanceWindowMs)") < upload.index(
+    "Update.begin("
+)
+assert "deadline = kMaintenanceWindowMs;" in upload
 assert setup.index("setupWeb(selfCheckPassed);") < setup.index('requestBtLifecycle(false, "boot")')
 assert setup.index("startOtaGuard();") < setup.index("networkSelfCheck()")
 assert '"confirm_on_denon"' in source
@@ -312,6 +342,7 @@ for route in (
     "/api/network",
     "/api/firmware/confirm",
     "/api/restart",
+    "/api/firmware/maintenance",
 ):
     assert f'server.on("{route}"' in web
 assert r'\"network_mode\":' in source

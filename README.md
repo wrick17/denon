@@ -72,7 +72,23 @@ and the write leaves it in place. Every later update goes over Wi-Fi.
 
 ### Wi-Fi firmware updates
 
-1. Upload the image as a raw body with the device token:
+Wi-Fi and Bluetooth share one radio, and uploads to the ESP32 run at a few
+KB/s while Bluetooth runs, so an image can hit the 120-second upload limit.
+Start a maintenance boot first:
+
+1. Request maintenance from the home network with the setup access point
+   closed:
+
+   ```sh
+   curl -X POST http://<ESP32_HOST>/api/firmware/maintenance \
+     -H 'Authorization: Bearer <DEVICE_TOKEN>'
+   ```
+
+   It returns `202`, closes the Bluetooth links and restarts into a boot that
+   never starts Bluetooth and turns Wi-Fi power save off. Wait until
+   `GET /api/state` reports `maintenance` as `true`;
+   `maintenance_remaining_ms` counts down the 10-minute window.
+2. Upload the image as a raw body with the device token:
 
    ```sh
    curl -X POST http://<ESP32_HOST>/api/firmware \
@@ -82,10 +98,10 @@ and the write leaves it in place. Every later update goes over Wi-Fi.
    ```
 
    The ESP32 returns `202`, closes its Bluetooth links and restarts into the
-   other slot.
-2. Wait until `GET /api/state` reports `ota_state` as `trial` and the new
+   other slot. That boot is a normal one, with Bluetooth.
+3. Wait until `GET /api/state` reports `ota_state` as `trial` and the new
    `ota_slot`.
-3. Within 10 minutes of that boot, confirm the image from the home network with
+4. Within 10 minutes of that boot, confirm the image from the home network with
    the setup access point closed:
 
    ```sh
@@ -94,6 +110,24 @@ and the write leaves it in place. Every later update goes over Wi-Fi.
    ```
 
    It returns `200 {"confirmed":true}`.
+
+Maintenance rules:
+
+- The bearer token is required, and the request returns `403` through the
+  setup access point or while it runs, and `409` while the running image is
+  still unconfirmed.
+- Any restart leaves maintenance: a successful upload, the end of the
+  10-minute window, a crash or a watchdog reset all boot normally. Another
+  request during maintenance restarts into a fresh window.
+- Ending the receiver link has the usual cost: the Denon accepts the next
+  link only after a power cycle, which the
+  [link alert](#link-alert-in-home-assistant) automation performs.
+- The maintenance restart is not a Bluetooth fault and is not a network
+  watchdog restart, so the next normal boot starts Bluetooth at once.
+- An upload must finish inside the window: in a maintenance boot the
+  120-second upload limit is cut to the window's end, and an upload that
+  starts after the window has ended returns `409`.
+- Uploading without maintenance still works when the link is fast enough.
 
 Upload rules:
 
@@ -116,8 +150,8 @@ Confirmation and rollback:
 - `ota_last_result` in `GET /api/state` reports `ok`, `rolled_back`,
   `fallback` or `fallback_failed`.
 - If the firmware self-check fails, the ESP32 serves only info, pairing, state,
-  logs, firmware upload, restart and coredump. Bluetooth, controls and
-  confirmation stay off, so a fixed image can still be installed.
+  logs, firmware upload and maintenance, restart and coredump. Bluetooth,
+  controls and confirmation stay off, so a fixed image can still be installed.
 
 ## Guided setup
 
@@ -386,6 +420,12 @@ go out one at a time from a bounded queue. A volume step is never queued: it is
 sent only when no write is in flight and the link is not congested, otherwise
 the restore or manual request retries from fresh receiver feedback.
 
+The controller runs in Classic mode only; the BLE controller memory goes
+back to the heap at boot (about 5 KB). Before the controller starts, the
+firmware sets Wi-Fi power save back to `min`, because the coexistence layer
+aborts when the controller starts with it off; if that fails, the start fails
+with `wifi_ps_restore_failed` and is retried.
+
 The ESP32 stays connectable but hidden, accepts a control link from the bonded
 receiver, and connects at once over an ACL link the receiver opens. Its own
 reconnect attempts follow this ladder:
@@ -408,6 +448,14 @@ reconnect attempts follow this ladder:
   Bluetooth runs, the next boot waits 3 minutes before starting Bluetooth so
   HTTP and updates are reachable first. A stack start that hangs for 45 seconds
   or a failed stack teardown reboots into the same delay.
+- A network watchdog covers a loop that keeps running while Wi-Fi stops
+  carrying replies and still reports a connection. It arms once station
+  clients have been answered for 5 minutes with no 5-minute gap. Then
+  5 minutes with no complete reply reconnects Wi-Fi once, and 10 minutes
+  restarts the board. While Wi-Fi is down, the normal Wi-Fi retries own
+  recovery, and after each reassociation the watchdog waits 1 minute. Home Assistant polls every few seconds, so a
+  Home Assistant outage longer than 10 minutes also causes one restart; the
+  watchdog then stays unarmed until polling resumes for 5 minutes.
 
 `GET /api/state` reports the link and recovery state:
 
@@ -423,7 +471,12 @@ reconnect attempts follow this ladder:
 | `bt_controller_enabled` | whether the Bluetooth controller runs |
 | `bt_event_drops`, `bt_rx_drops` | queue overflows; a lost event drops and reconnects the link |
 | `reset_reason` | ESP-IDF reset reason of this boot |
+| `network_watchdog_reconnects` | Wi-Fi reconnects forced by the network watchdog since boot |
+| `network_watchdog_restarted` | whether the network watchdog restarted the board before this boot |
 | `ota_slot`, `ota_state`, `ota_trial_boots`, `ota_last_result` | running slot and update state |
+| `maintenance`, `maintenance_remaining_ms` | whether this is a maintenance boot, and the time left in its window (`null` otherwise) |
+| `wifi_ps` | Wi-Fi power save the driver reports: `none`, `min` or `max` |
+| `free_heap_bytes`, `min_free_heap_bytes`, `largest_free_block_bytes` | free heap now, its low mark since boot, and the largest allocatable block |
 
 The passive diagnostics fields `bt_acl_connect_count`,
 `bt_acl_last_connect_status`, `bt_acl_last_connect_at_ms`,
@@ -518,8 +571,9 @@ Receiver and provisioning controls:
 Maintenance, all with `Authorization: Bearer <DEVICE_TOKEN>` and never
 authorized by the setup access point:
 
-- `POST /api/firmware` and `POST /api/firmware/confirm` install and confirm an
-  update; see [Wi-Fi firmware updates](#wi-fi-firmware-updates).
+- `POST /api/firmware/maintenance`, `POST /api/firmware` and
+  `POST /api/firmware/confirm` prepare, install and confirm an update; see
+  [Wi-Fi firmware updates](#wi-fi-firmware-updates).
 - `POST /api/restart` with form field `mode=clean` closes the Bluetooth links
   first; `mode=abrupt` restarts at once to simulate a crash. Both return `202`.
 - `GET /api/coredump` streams the stored crash dump as `coredump.bin`, or
@@ -615,11 +669,12 @@ tests; return to TV Audio afterward. See `ACCEPTANCE.md`.
 
 `homeassistant/packages/denon_link_alert.yaml` polls `GET /api/state` every
 10 seconds. After the link has been down for 30 seconds it switches the
-Denon's smart socket off and back on after 1 second, at most once per
-10 minutes, unless the socket is already off; an unreachable ESP32 does not
-cycle the Denon. It sends a phone
-notification after the link has been down, or the ESP32 unreachable, for
-1 minute, and again when the link returns.
+Denon's smart socket off and back on after 1 second, unless the socket is
+already off; an unreachable ESP32 does not cycle the Denon. It rechecks every
+minute while the link is off, cycles at most once per 10 minutes, and hourly
+after the link has been down for an hour. After each cycle it makes sure the
+socket turned back on. It sends a phone notification after the link has been
+down, or the ESP32 unreachable, for 1 minute, and again when the link returns.
 
 1. Copy the file to `<HOME_ASSISTANT_CONFIG>/packages/` and enable packages in
    `configuration.yaml` with `homeassistant: packages: !include_dir_named

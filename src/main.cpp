@@ -48,6 +48,19 @@ constexpr char kApiVersion[] = "1";
 constexpr uint16_t kHttpPort = 80;
 constexpr unsigned long kWifiTimeoutMs = 15000;
 constexpr uint32_t kWifiReconnectMs = 30000;
+// Home Assistant polls every few seconds, so this much silence means the
+// network is wedged even if the driver still reports a connection.
+constexpr uint32_t kNetworkSilentReconnectMs = 5UL * 60UL * 1000UL;
+constexpr uint32_t kNetworkSilentRestartMs = 10UL * 60UL * 1000UL;
+// Arms only after replies spread over this long, so one stray request after a
+// restart cannot schedule another.
+constexpr uint32_t kNetworkWatchdogArmMs = 5UL * 60UL * 1000UL;
+// After a reassociation the watchdog waits this long for replies to resume.
+constexpr uint32_t kNetworkReassociateGraceMs = 60000;
+constexpr uint32_t kNetworkWatchdogMarker = 0x7E7D06ED;
+// A maintenance boot leaves Bluetooth off so a Wi-Fi upload gets the radio.
+constexpr uint32_t kMaintenanceMarker = 0x3A17B007;
+constexpr unsigned long kMaintenanceWindowMs = 10UL * 60UL * 1000UL;
 constexpr unsigned long kReconnectMs = 5000;
 constexpr unsigned long kStatusIntervalMs = 5000;
 constexpr unsigned long kBondRemovalTimeoutMs = 3000;
@@ -61,6 +74,7 @@ constexpr unsigned long kA2dpTransitionTimeoutMs = 60000;
 constexpr unsigned long kSppServerRetryMs = 60000;
 constexpr size_t kBtRxChunkBytes = 128;
 constexpr unsigned long kFirmwareBodyTimeoutMs = 120000;
+constexpr unsigned long kCoredumpSendTimeoutMs = 60000;
 constexpr uint32_t kBtLifecycleMarker = 0xB7C1F00D;
 constexpr unsigned long kCleanShutdownMs = 2000;
 constexpr uint32_t kLoopWatchdogSeconds = 60;
@@ -99,7 +113,18 @@ Preferences preferences;
 Preferences otaPreferences;  // "ota" namespace; opened before the self-checks
 // Set while the Bluetooth lifecycle task runs; survives panic/watchdog resets.
 RTC_NOINIT_ATTR uint32_t rtcBtLifecycleMarker;
+// Set just before a network-watchdog restart; read once at the next boot.
+RTC_NOINIT_ATTR uint32_t rtcNetworkWatchdogMarker;
+// Set just before a maintenance restart; consumed at the next boot.
+RTC_NOINIT_ATTR uint32_t rtcMaintenanceMarker;
+bool maintenanceMode = false;
 bool stationHttpClaimed = false;
+// Last station response whose every write the socket accepted.
+uint32_t stationReplyAt = 0;
+uint32_t stationFirstReplyAt = 0;
+bool stationReplySeen = false;
+uint32_t networkWatchdogReconnects = 0;
+bool networkWatchdogRestarted = false;
 
 bool isSetupApIngress(bool apRunning, bool matchesAp, bool matchesStation) {
   return apRunning && matchesAp && !matchesStation;
@@ -116,16 +141,37 @@ class StationAwareWebServer : public WebServer {
   // client() returns a copy; stopping a copy leaves the request socket open.
   WiFiClient &requestClient() { return _currentClient; }
 
+  // A response is written within one handleClient() call; it counts as a
+  // station reply only if every write of it was accepted.
+  void handleClientTracked() {
+    stationWrote = false;
+    writeFailed = false;
+    handleClient();
+    if (!stationWrote || writeFailed) return;
+    const uint32_t now = static_cast<uint32_t>(millis());
+    // Steady polling means no gap long enough to trip the watchdog.
+    if (!stationReplySeen || now - stationReplyAt >= kNetworkSilentReconnectMs) {
+      stationFirstReplyAt = now;
+    }
+    stationReplyAt = now;
+    stationReplySeen = true;
+  }
+
+  bool responseWriteFailed() const { return writeFailed; }
+  void markResponseIncomplete() { writeFailed = true; }
+
  protected:
   size_t _currentClientWrite(const char *buffer, size_t length) override {
     const size_t written = WebServer::_currentClientWrite(buffer, length);
     if (length > 0 && written == length) markStationRequest();
+    if (written != length) writeFailed = true;
     return written;
   }
 
   size_t _currentClientWrite_P(PGM_P buffer, size_t length) override {
     const size_t written = WebServer::_currentClientWrite_P(buffer, length);
     if (length > 0 && written == length) markStationRequest();
+    if (written != length) writeFailed = true;
     return written;
   }
 
@@ -136,8 +182,12 @@ class StationAwareWebServer : public WebServer {
                          localAddress == WiFi.localIP(),
                          localAddress == WiFi.softAPIP())) {
       stationHttpClaimed = true;
+      stationWrote = true;
     }
   }
+
+  bool stationWrote = false;
+  bool writeFailed = false;
 };
 
 StationAwareWebServer server(kHttpPort);
@@ -462,6 +512,20 @@ bool shouldStopSetupAp(bool staticConfigured, bool stationClaimed) {
   return !staticConfigured || stationClaimed;
 }
 
+enum class NetworkWatchdogAction { none, reconnect, restart };
+
+// Armed only once something has polled the board steadily this boot, so a
+// board nobody polls never restarts.
+NetworkWatchdogAction networkWatchdogAction(bool armed, uint32_t silentMs,
+                                            bool reconnected) {
+  if (!armed) return NetworkWatchdogAction::none;
+  if (silentMs >= kNetworkSilentRestartMs) return NetworkWatchdogAction::restart;
+  if (silentMs >= kNetworkSilentReconnectMs && !reconnected) {
+    return NetworkWatchdogAction::reconnect;
+  }
+  return NetworkWatchdogAction::none;
+}
+
 bool networkSelfCheck() {
   IPAddress parsed;
   IPAddress gateway;
@@ -474,6 +538,16 @@ bool networkSelfCheck() {
          parsed[3] == 7 && validStaticNetwork(parsed, gateway, subnet, dns) &&
          !validStaticNetwork(gateway, gateway, subnet, dns) &&
          shouldStopSetupAp(false, false) &&
+         networkWatchdogAction(false, kNetworkSilentRestartMs, false) ==
+             NetworkWatchdogAction::none &&
+         networkWatchdogAction(true, kNetworkSilentReconnectMs - 1, false) ==
+             NetworkWatchdogAction::none &&
+         networkWatchdogAction(true, kNetworkSilentReconnectMs, false) ==
+             NetworkWatchdogAction::reconnect &&
+         networkWatchdogAction(true, kNetworkSilentReconnectMs, true) ==
+             NetworkWatchdogAction::none &&
+         networkWatchdogAction(true, kNetworkSilentRestartMs, true) ==
+             NetworkWatchdogAction::restart &&
          !shouldStopSetupAp(true, false) && shouldStopSetupAp(true, true) &&
          isSetupApIngress(true, true, false) &&
          !isSetupApIngress(true, false, true) &&
@@ -872,6 +946,50 @@ void maintainWifi() {
     Serial.printf("Wi-Fi retry %lu: connect result 0x%x\n",
                   static_cast<unsigned long>(wifiRetryCount),
                   static_cast<unsigned>(result));
+  }
+}
+
+// Recovers a network that stopped carrying replies while the loop still runs,
+// which the loop watchdog cannot see. While the station is down, maintainWifi()
+// owns recovery, and each reassociation gets a short grace period.
+void maintainNetworkWatchdog() {
+  static bool stationUp = false;
+  static bool reconnected = false;
+  static uint32_t upSince = 0;
+  static uint32_t lastReply = 0;
+  const uint32_t now = static_cast<uint32_t>(millis());
+  if (WiFi.status() != WL_CONNECTED) {
+    stationUp = false;
+    return;
+  }
+  if (!stationUp) {
+    stationUp = true;
+    upSince = now;
+  }
+  if (stationReplyAt != lastReply) {
+    lastReply = stationReplyAt;
+    reconnected = false;
+  }
+  if (now - upSince < kNetworkReassociateGraceMs) return;
+  const bool armed = stationReplySeen &&
+                     stationReplyAt - stationFirstReplyAt >= kNetworkWatchdogArmMs;
+  const uint32_t silentMs = now - stationReplyAt;
+  switch (networkWatchdogAction(armed, silentMs, reconnected)) {
+    case NetworkWatchdogAction::none:
+      return;
+    case NetworkWatchdogAction::reconnect:
+      reconnected = true;
+      ++networkWatchdogReconnects;
+      Serial.printf("Network watchdog: no station reply for %lu s; reconnecting Wi-Fi\n",
+                    static_cast<unsigned long>(silentMs / 1000));
+      WiFi.reconnect();
+      return;
+    case NetworkWatchdogAction::restart:
+      Serial.printf("Network watchdog: no station reply for %lu s; restarting\n",
+                    static_cast<unsigned long>(silentMs / 1000));
+      rtcNetworkWatchdogMarker = kNetworkWatchdogMarker;
+      restartDevice(true);
+      return;
   }
 }
 
@@ -2247,9 +2365,17 @@ const char *btTeardown() {
 
 const char *btStartup() {
   esp_bt_controller_config_t config = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+  // setup() released the BLE controller memory; this firmware is Classic only.
+  config.mode = ESP_BT_MODE_CLASSIC_BT;
   if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE &&
       esp_bt_controller_init(&config) != ESP_OK) {
     return "controller_init_failed";
+  }
+  // The coexistence layer aborts when the controller enables with Wi-Fi power
+  // save off, so restore it first. No Wi-Fi driver means no coexistence.
+  if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED) {
+    const esp_err_t ps = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    if (ps != ESP_OK && ps != ESP_ERR_WIFI_NOT_INIT) return "wifi_ps_restore_failed";
   }
   if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED &&
       esp_bt_controller_enable(static_cast<esp_bt_mode_t>(config.mode)) != ESP_OK) {
@@ -3766,7 +3892,11 @@ void sendState() {
   body += ",\"uptime_ms\":" + String(millis()) +
           ",\"free_heap_bytes\":" + String(ESP.getFreeHeap()) +
           ",\"min_free_heap_bytes\":" + String(ESP.getMinFreeHeap()) +
+          ",\"largest_free_block_bytes\":" + String(ESP.getMaxAllocHeap()) +
           ",\"wifi_retry_count\":" + String(wifiRetryCount) +
+          ",\"network_watchdog_reconnects\":" + String(networkWatchdogReconnects) +
+          ",\"network_watchdog_restarted\":" +
+          String(networkWatchdogRestarted ? "true" : "false") +
           ",\"wifi_rssi_dbm\":";
   body += WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : "null";
   body += ",\"wifi_last_disconnect_reason\":";
@@ -3824,6 +3954,17 @@ void sendState() {
           "\",\"ota_trial_boots\":" + String(otaTrialBoots) +
           ",\"ota_last_result\":";
   body += otaLastResult.isEmpty() ? "null" : "\"" + jsonEscape(otaLastResult) + "\"";
+  body += ",\"maintenance\":" + String(maintenanceMode ? "true" : "false") +
+          ",\"maintenance_remaining_ms\":";
+  body += maintenanceMode
+              ? String(now < kMaintenanceWindowMs ? kMaintenanceWindowMs - now : 0UL)
+              : "null";
+  wifi_ps_type_t ps;
+  body += ",\"wifi_ps\":";
+  body += esp_wifi_get_ps(&ps) != ESP_OK
+              ? "null"
+              : (ps == WIFI_PS_NONE ? "\"none\""
+                                    : (ps == WIFI_PS_MIN_MODEM ? "\"min\"" : "\"max\""));
   body += "}";
   server.send(200, "application/json", body);
 }
@@ -4321,6 +4462,11 @@ void receiveFirmware() {
     rejectFirmware(409, "Running firmware is not confirmed yet");
     return;
   }
+  // Bluetooth stays off only for the window, so an upload must fit inside it.
+  if (maintenanceMode && timeReached(millis(), kMaintenanceWindowMs)) {
+    rejectFirmware(409, "Maintenance window has ended");
+    return;
+  }
   const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
   if (!target) {
     rejectFirmware(503, "No update slot is available");
@@ -4341,7 +4487,10 @@ void receiveFirmware() {
   static uint8_t chunk[1024];
   uint8_t header[kFirmwareHeaderBytes];
   size_t received = 0;
-  const unsigned long deadline = millis() + kFirmwareBodyTimeoutMs;
+  unsigned long deadline = millis() + kFirmwareBodyTimeoutMs;
+  if (maintenanceMode && timeReached(deadline, kMaintenanceWindowMs)) {
+    deadline = kMaintenanceWindowMs;
+  }
   while (received < static_cast<size_t>(length)) {
     esp_task_wdt_reset();
     if (timeReached(millis(), deadline)) {
@@ -4435,15 +4584,23 @@ void sendCoredump() {
   server.setContentLength(size);
   server.send(200, "application/octet-stream", "");
   static char chunk[1024];
+  const unsigned long deadline = millis() + kCoredumpSendTimeoutMs;
   for (size_t offset = 0; offset < size;) {
     esp_task_wdt_reset();
     const size_t length = min(sizeof(chunk), size - offset);
-    if (esp_flash_read(nullptr, chunk, address + offset, length) != ESP_OK ||
+    if (timeReached(millis(), deadline) ||
+        esp_flash_read(nullptr, chunk, address + offset, length) != ESP_OK ||
         !server.client().connected()) {
+      server.markResponseIncomplete();
       server.requestClient().stop();
       return;
     }
     server.sendContent(chunk, length);
+    // A client that stops reading would otherwise hold the loop for minutes.
+    if (server.responseWriteFailed()) {
+      server.requestClient().stop();
+      return;
+    }
     offset += length;
   }
 }
@@ -4475,8 +4632,38 @@ void restartApi() {
   restartDevice(mode == "clean");
 }
 
-// Recovery routes (info, pairing, state, logs, firmware upload, restart,
-// coredump) are always served; normal controls only after the self-checks.
+bool requireBearerToken() {
+  if (hasAppAuthorization()) return true;
+  server.sendHeader("WWW-Authenticate", "Bearer");
+  server.send(401, "text/plain", "Missing or invalid bearer token");
+  return false;
+}
+
+// Restarts into a boot without Bluetooth and with Wi-Fi power save off, so an
+// upload gets the whole radio. Calling it again starts a fresh window.
+void enterMaintenance() {
+  if (!requireBearerToken()) return;
+  if (setupApRunning || !currentRequestUsesStation()) {
+    server.send(403, "text/plain",
+                "Start maintenance over the home network with the setup AP off");
+    return;
+  }
+  // An upload is refused until then, and confirming needs a normal boot.
+  if (otaTrialActive || otaPendingVerify) {
+    server.send(409, "text/plain", "Running firmware is not confirmed yet");
+    return;
+  }
+  Serial.println("Maintenance requested; restarting without Bluetooth");
+  server.send(202, "application/json",
+              "{\"maintenance\":true,\"restarting\":true,\"window_ms\":" +
+                  String(kMaintenanceWindowMs) + "}");
+  rtcMaintenanceMarker = kMaintenanceMarker;
+  restartDevice(true);  // closes the receiver links first
+}
+
+// Recovery routes (info, pairing, state, logs, firmware upload and
+// maintenance, restart, coredump) are always served; normal controls only
+// after the self-checks.
 void setupWeb(bool full) {
   const char *headers[] = {"Authorization", "If-Match", "Origin", "Host"};
   server.collectHeaders(headers, 4);
@@ -4485,6 +4672,7 @@ void setupWeb(bool full) {
   server.on("/api/state", HTTP_GET, sendState);
   server.on("/api/logs", HTTP_GET, sendLogs);
   server.addHandler(new FirmwareHandler());
+  server.on("/api/firmware/maintenance", HTTP_POST, enterMaintenance);
   server.on("/api/restart", HTTP_POST, restartApi);
   server.on("/api/coredump", HTTP_GET, sendCoredump);
   server.on("/api/coredump", HTTP_DELETE, eraseCoredump);
@@ -4532,9 +4720,24 @@ void setup() {
   // Kept armed through a deferred start, so a reset during the deferral
   // defers again; requestBtLifecycle() re-arms it when Bluetooth starts.
   if (resetReason == ESP_RST_POWERON) rtcBtLifecycleMarker = 0;
+  // Only a software restart is ours; a hang in the clean shutdown resets via a
+  // watchdog instead and must not be reported as a network-watchdog restart.
+  networkWatchdogRestarted = resetReason == ESP_RST_SW &&
+                             rtcNetworkWatchdogMarker == kNetworkWatchdogMarker;
+  rtcNetworkWatchdogMarker = 0;
+  // Same rule; consumed here, so any later restart boots normally.
+  maintenanceMode = resetReason == ESP_RST_SW &&
+                    rtcMaintenanceMarker == kMaintenanceMarker;
+  rtcMaintenanceMarker = 0;
   pinMode(kBootButtonPin, INPUT_PULLUP);
   selfCheckPassed = protocolSelfCheck() && appStateSelfCheck() && jsonSelfCheck() &&
                     networkSelfCheck();
+  // Classic only: hand the BLE controller memory to the heap before any
+  // controller init. The release is one-way, so it happens once per boot, and
+  // a boot that never starts Bluetooth hands back all of it.
+  esp_bt_controller_mem_release(selfCheckPassed && !maintenanceMode
+                                    ? ESP_BT_MODE_BLE
+                                    : ESP_BT_MODE_BTDM);
   preferences.begin("denon", false);
   loadDeviceIdentity();
   if (selfCheckPassed) {
@@ -4556,10 +4759,17 @@ void setup() {
         Serial.printf("Wi-Fi station disconnected, reason %d\n", reason);
       },
       ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  // Without Bluetooth the coexistence layer allows power save off.
+  if (maintenanceMode) WiFi.setSleep(WIFI_PS_NONE);
   startWifi();
   // HTTP (and so OTA) comes up before Bluetooth and never waits for it.
   setupWeb(selfCheckPassed);
   if (!selfCheckPassed) return;
+  if (maintenanceMode) {
+    btLastError = "maintenance";
+    Serial.println("Maintenance boot: Bluetooth stays off for 10 minutes");
+    return;
+  }
   btEvents = xQueueCreate(kBtEventQueueLength, sizeof(BtEvent));
   btRx = xMessageBufferCreate(kBtRxBufferBytes);
   if (!btEvents || !btRx) {
@@ -4578,11 +4788,17 @@ void loop() {
   maintainTokenResetButton();
   // Receiver feedback (a mute report) is parsed before anything can send.
   if (bluetoothReady) readDenon();
-  server.handleClient();
+  server.handleClientTracked();
   if (setupApRunning) dnsServer.processNextRequest();
   if (firmwareRestartPending) restartDevice(true);
   maintainWifi();
+  maintainNetworkWatchdog();
   maintainOtaGuard();
+  // A successful upload restarts above; otherwise the window ends here.
+  if (maintenanceMode && timeReached(millis(), kMaintenanceWindowMs)) {
+    Serial.println("Maintenance window ended; restarting normally");
+    restartDevice(true);
+  }
   if (!selfCheckPassed) return;
   maintainBtLifecycle();  // consume the lifecycle result before any event
   if (bluetoothReady) readDenon();
